@@ -54,7 +54,14 @@ fi
 echo ""
 echo -e "${YELLOW}[1/4] 停止并删除 Docker 容器...${NC}"
 cd "$PROJECT_DIR"
-docker compose down -v 2>/dev/null || true
+
+# 检测 docker compose 命令格式
+if docker compose version &> /dev/null; then
+    docker compose down -v 2>/dev/null || true
+elif docker-compose --version &> /dev/null; then
+    docker-compose down -v 2>/dev/null || true
+fi
+
 echo -e "${GREEN}✓ 容器已停止并删除${NC}"
 
 # 删除 Docker 镜像

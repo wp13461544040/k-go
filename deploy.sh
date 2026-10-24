@@ -150,7 +150,17 @@ services:
 EOF
 
 # 构建并启动容器
-docker compose up -d --build
+# 检测 docker compose 命令格式
+if docker compose version &> /dev/null; then
+    # Docker Compose V2 (插件)
+    docker compose up -d --build
+elif docker-compose --version &> /dev/null; then
+    # Docker Compose V1 (独立命令)
+    docker-compose up -d --build
+else
+    echo -e "${RED}Docker Compose 未安装${NC}"
+    exit 1
+fi
 
 # 等待服务启动
 echo ""
@@ -158,7 +168,12 @@ echo -e "${YELLOW}等待服务启动...${NC}"
 sleep 10
 
 # 检查服务状态
-if docker compose ps | grep -q "Up"; then
+COMPOSE_CMD="docker compose"
+if ! docker compose version &> /dev/null; then
+    COMPOSE_CMD="docker-compose"
+fi
+
+if $COMPOSE_CMD ps | grep -q "Up"; then
     echo ""
     echo -e "${GREEN}================================${NC}"
     echo -e "${GREEN}  ✓ Kiro-Go 部署成功！${NC}"
@@ -177,13 +192,13 @@ if docker compose ps | grep -q "Up"; then
     echo -e "  OpenAI API: ${GREEN}http://$(hostname -I | awk '{print $1}'):${PORT}/v1/chat/completions${NC}"
     echo ""
     echo "常用命令："
-    echo "  查看日志: cd $PROJECT_DIR && docker compose logs -f"
-    echo "  重启服务: cd $PROJECT_DIR && docker compose restart"
-    echo "  停止服务: cd $PROJECT_DIR && docker compose down"
-    echo "  更新服务: cd $PROJECT_DIR && git pull && docker compose up -d --build"
+    echo "  查看日志: cd $PROJECT_DIR && $COMPOSE_CMD logs -f"
+    echo "  重启服务: cd $PROJECT_DIR && $COMPOSE_CMD restart"
+    echo "  停止服务: cd $PROJECT_DIR && $COMPOSE_CMD down"
+    echo "  更新服务: cd $PROJECT_DIR && git pull && $COMPOSE_CMD up -d --build"
     echo ""
 else
     echo -e "${RED}服务启动失败，请查看日志：${NC}"
-    echo "docker compose logs"
+    echo "$COMPOSE_CMD logs"
     exit 1
 fi
