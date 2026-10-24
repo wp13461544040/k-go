@@ -1381,10 +1381,20 @@
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.subscription')) + '</h4><div class="detail-grid">' +
       detailItem(t('detail.subscriptionType'), a.subscriptionTitle || (a.subscriptionType ? formatSubscriptionLabel(a.subscriptionType) : '-')) +
       detailItem(t('detail.tokenExpiry'), a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') +
-      detailItem(t('detail.mainQuota'), (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0)) +
       detailItem(t('detail.resetDate'), a.nextResetDate || '-') +
+      '</div></div>' +
+
+      '<div class="detail-section"><h4>' + escapeHtml(t('detail.mainQuota')) + '</h4><div class="detail-grid">' +
+      detailItem(t('detail.totalCreditsLimit'), (a.usageLimit != null ? a.usageLimit.toFixed(1) : 0) + ' Credits') +
+      detailItem(t('detail.usedCredits'), (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' Credits') +
+      detailItem(t('detail.remainingCredits'), (a.usageLimit != null && a.usageCurrent != null ? (a.usageLimit - a.usageCurrent).toFixed(1) : 0) + ' Credits') +
+      detailItem(t('detail.usagePercentage'), ((a.usagePercent || 0) * 100).toFixed(1) + '%') +
       (a.trialUsageLimit > 0 ?
-        detailItem(t('detail.trialQuota'), (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + a.trialUsageLimit.toFixed(0)) +
+        '</div></div><div class="detail-section"><h4>' + escapeHtml(t('detail.trialQuota')) + '</h4><div class="detail-grid">' +
+        detailItem(t('detail.totalCreditsLimit'), a.trialUsageLimit.toFixed(1) + ' Credits') +
+        detailItem(t('detail.usedCredits'), (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' Credits') +
+        detailItem(t('detail.remainingCredits'), (a.trialUsageLimit != null && a.trialUsageCurrent != null ? (a.trialUsageLimit - a.trialUsageCurrent).toFixed(1) : 0) + ' Credits') +
+        detailItem(t('detail.usagePercentage'), ((a.trialUsagePercent || 0) * 100).toFixed(1) + '%') +
         detailItem(t('detail.trialStatus'), a.trialStatus || '-') +
         detailItem(t('detail.trialExpiry'), a.trialExpiresAt ? new Date(a.trialExpiresAt * 1000).toLocaleString() : '-')
         : '') +
@@ -3389,7 +3399,7 @@
       if (!currentVersion) await loadVersion();
       const current = currentVersion.replace(/^v/i, '');
       if (!current) throw new Error('Current version missing');
-      const res = await fetch('https://raw.githubusercontent.com/Quorinex/Kiro-Go/main/version.json?t=' + Date.now());
+      const res = await fetch('https://raw.githubusercontent.com/wp13461544040/k-go/main/version.json?t=' + Date.now());
       if (!res.ok) throw new Error('Fetch failed');
       const d = await res.json();
       const latest = (d.version || '').replace(/^v/i, '');
