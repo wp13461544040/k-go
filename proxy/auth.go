@@ -1,0 +1,176 @@
+package proxy
+
+import (
+	"context"
+	"crypto/subtle"
+	"kiro-go/config"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// apiKeyContextKey is an unexported type used as the context key for the matched ApiKeyEntry
+// so it cannot collide with keys defined in other packages.
+type apiKeyContextKey struct{}
+
+// authError describes why authentication failed. status is the HTTP status code to send.
+type authError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e *authError) Error() string { return e.message }
+
+func newAuthError(status int, code, message string) *authError {
+	return &authError{status: status, code: code, message: message}
+}
+
+// extractProvidedKey reads the API key from Authorization (Bearer ...) or X-Api-Key header.
+func extractProvidedKey(r *http.Request) string {
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		return strings.TrimPrefix(authHeader, "Bearer ")
+	}
+	if v := r.Header.Get("X-Api-Key"); v != "" {
+		return v
+	}
+	return ""
+}
+
+// authenticate validates an incoming request against the configured API keys.
+//
+// Master switch: config.RequireApiKey. When false, requests pass without checking
+// any keys, even if entries exist (so the admin UI can hold draft keys without
+// affecting public deployments).
+//
+// When RequireApiKey is true:
+//  1. If ApiKeys is non-empty, the provided key MUST match an enabled, in-quota
+//     entry. Returns the matched entry (a copy) so callers can attribute usage.
+//  2. Else if the legacy single ApiKey field is set, the provided key MUST match it.
+//  3. Else (switch on but nothing configured) → fail-closed: every request is rejected.
+//     This prevents the prior bug where toggling auth on without keys silently
+//     left the service open.
+//
+// Returns (entry, nil) on success. entry is nil when the legacy single-key path
+// is used or when the master switch is off.
+func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
+	if !config.IsApiKeyRequired() {
+		return nil, nil
+	}
+
+	provided := extractProvidedKey(r)
+
+	if config.HasApiKeys() {
+		if provided == "" {
+			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		}
+		entry := config.FindApiKeyByValue(provided)
+		if entry == nil {
+			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+		}
+		if !entry.Enabled {
+			return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key disabled")
+		}
+		if overToken, overCredit := config.ApiKeyOverLimit(*entry); overToken || overCredit {
+			// D3: notify webhook (key id/name + limit type only — no key value).
+			// Cool by key so a client retrying on 429 can't storm the webhook +
+			// spawn unbounded goroutines while the key stays over quota.
+			if shouldNotifyOverLimit(entry.ID, time.Now()) {
+				limitType := "credit"
+				if overToken {
+					limitType = "token"
+				}
+				notifyWebhook("key.over_limit", map[string]interface{}{
+					"apiKeyId":   entry.ID,
+					"apiKeyName": entry.Name,
+					"limitType":  limitType,
+				})
+			}
+			if overToken {
+				return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "token limit exceeded")
+			}
+			return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+		}
+		// B7: per-key IP allowlist. Non-empty AllowedIPs restricts which client
+		// IPs may use this key. Checked AFTER auth + quota so a rejected IP never
+		// reveals whether the key exists — it only fires for a valid, enabled,
+		// in-quota key, returning the same 403 an outsider would get.
+		if len(entry.AllowedIPs) > 0 && !ipAllowed(clientIP(r), entry.AllowedIPs) {
+			return nil, newAuthError(http.StatusForbidden, "authentication_error", "IP not allowed")
+		}
+		return entry, nil
+	}
+
+	// Legacy single-key path.
+	expected := config.GetApiKey()
+	if expected == "" {
+		// Auth required but nothing configured → fail closed.
+		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key authentication is required but no keys are configured")
+	}
+	// Constant-time compare so a network observer cannot time-attack the key
+	// (byte-by-byte early-exit of `provided != expected` would leak the length of
+	// the correct prefix). Matches the constant-time check already used for the
+	// admin password (handler.go) and audit-log password (prod_middleware.go).
+	if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+	}
+	return nil, nil
+}
+
+// withApiKeyContext attaches the matched entry to the request context so downstream
+// handlers (recordSuccess, etc.) can credit usage against the correct key.
+func withApiKeyContext(r *http.Request, entry *config.ApiKeyEntry) *http.Request {
+	if entry == nil {
+		return r
+	}
+	ctx := context.WithValue(r.Context(), apiKeyContextKey{}, entry.ID)
+	return r.WithContext(ctx)
+}
+
+// ipAllowed reports whether clientAddr matches any entry in the allowed list.
+// Entries may be exact IP strings ("1.2.3.4") or CIDR ranges ("10.0.0.0/8").
+// An empty allowed list means "allow all". Bare-IP entries are matched both by
+// raw string equality and by net.IP equality (so "::1" matches the canonical
+// "0:0:0:0:0:0:0:1" form). CIDR entries are parsed once per check.
+func ipAllowed(clientAddr string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	clientIP := net.ParseIP(clientAddr)
+	for _, entry := range allowed {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+				if clientIP != nil && ipNet.Contains(clientIP) {
+					return true
+				}
+			}
+			continue
+		}
+		if entry == clientAddr {
+			return true
+		}
+		if clientIP != nil {
+			if ip := net.ParseIP(entry); ip != nil && ip.Equal(clientIP) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// apiKeyIDFromContext returns the matched API key ID stored in ctx, or empty string.
+func apiKeyIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(apiKeyContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
