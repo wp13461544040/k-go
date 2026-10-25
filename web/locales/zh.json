@@ -578,8 +578,11 @@
   "settings.saveWebhook": "保存 Webhook",
   "settings.webhookSaved": "Webhook 设置已保存",
   "logs.persisted": "日志重启后保留",
-  "accounts.summaryAccounts": "账号（启用/总数）",
-  "accounts.summaryRequests": "总请求",
-  "accounts.summaryTokens": "总 Tokens",
-  "accounts.summaryCredits": "总 Credits"
+  "accounts.summaryTotal": "账号总数",
+  "accounts.summaryAvailable": "可用账号数",
+  "accounts.summaryBanned": "已封禁账号数",
+  "accounts.summaryCreditsTotal": "所有账号积分总数",
+  "accounts.summaryCreditsUsed": "已使用积分",
+  "accounts.summaryCreditsRemaining": "未使用积分",
+  "accounts.summaryTokens": "总 Tokens"
 }

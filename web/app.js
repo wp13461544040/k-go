@@ -1160,27 +1160,52 @@
   // Sum cumulative usage across ALL accounts (not just the filtered list), so
   // the credits/tokens/requests totals stay stable while searching or filtering.
   function renderAccountsSummary() {
-    const elAccounts = $('accountsSummaryAccounts');
-    const elCredits = $('accountsSummaryCredits');
+    const elTotal = $('accountsSummaryTotal');
+    const elAvailable = $('accountsSummaryAvailable');
+    const elBanned = $('accountsSummaryBanned');
+    const elCreditsTotal = $('accountsSummaryCreditsTotal');
+    const elCreditsUsed = $('accountsSummaryCreditsUsed');
+    const elCreditsRemaining = $('accountsSummaryCreditsRemaining');
     const elTokens = $('accountsSummaryTokens');
-    const elRequests = $('accountsSummaryRequests');
-    if (!elAccounts || !elCredits || !elTokens || !elRequests) return;
+    if (!elTotal || !elAvailable || !elBanned || !elCreditsTotal || !elCreditsUsed || !elCreditsRemaining || !elTokens) return;
 
-    let enabledAccounts = 0;
-    let totalCredits = 0;
+    let totalAccounts = accountsData.length;
+    let availableAccounts = 0;
+    let bannedAccounts = 0;
+    let totalCreditsAll = 0;
+    let totalCreditsUsed = 0;
     let totalTokens = 0;
-    let totalRequests = 0;
+    
     for (const a of accountsData) {
-      if (a.enabled && !(a.banStatus && a.banStatus !== 'ACTIVE')) enabledAccounts++;
-      totalCredits += a.totalCredits || 0;
+      // 计算可用账号（启用且未封禁）
+      if (a.enabled && !(a.banStatus && a.banStatus !== 'ACTIVE')) {
+        availableAccounts++;
+      }
+      // 计算封禁账号
+      if (a.banStatus && a.banStatus !== 'ACTIVE') {
+        bannedAccounts++;
+      }
+      // 统计积分（所有账号的总积分）
+      if (a.usageCurrent !== undefined) {
+        totalCreditsAll += a.usageCurrent || 0;
+      }
+      // 统计已使用积分（totalCredits字段）
+      totalCreditsUsed += a.totalCredits || 0;
+      // 统计tokens
       totalTokens += a.totalTokens || 0;
-      totalRequests += a.requestCount || 0;
     }
+    
+    // 计算剩余积分
+    let creditsRemaining = totalCreditsAll - totalCreditsUsed;
+    if (creditsRemaining < 0) creditsRemaining = 0;
 
-    elAccounts.textContent = enabledAccounts + ' / ' + accountsData.length;
-    elCredits.textContent = formatCredits(totalCredits);
+    elTotal.textContent = formatNum(totalAccounts);
+    elAvailable.textContent = formatNum(availableAccounts);
+    elBanned.textContent = formatNum(bannedAccounts);
+    elCreditsTotal.textContent = formatCredits(totalCreditsAll);
+    elCreditsUsed.textContent = formatCredits(totalCreditsUsed);
+    elCreditsRemaining.textContent = formatCredits(creditsRemaining);
     elTokens.textContent = formatNum(totalTokens);
-    elRequests.textContent = formatNum(totalRequests);
   }
 
   function formatCredits(n) {

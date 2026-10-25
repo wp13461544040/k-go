@@ -578,8 +578,11 @@
   "settings.saveWebhook": "Save Webhook",
   "settings.webhookSaved": "Webhook settings saved",
   "logs.persisted": "Logs persist across restart",
-  "accounts.summaryAccounts": "Accounts (on / total)",
-  "accounts.summaryRequests": "Requests",
-  "accounts.summaryTokens": "Tokens",
-  "accounts.summaryCredits": "Credits"
+  "accounts.summaryTotal": "Total Accounts",
+  "accounts.summaryAvailable": "Available Accounts",
+  "accounts.summaryBanned": "Banned Accounts",
+  "accounts.summaryCreditsTotal": "Total Credits (All Accounts)",
+  "accounts.summaryCreditsUsed": "Credits Used",
+  "accounts.summaryCreditsRemaining": "Credits Remaining",
+  "accounts.summaryTokens": "Total Tokens"
 }
