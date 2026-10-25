@@ -577,5 +577,9 @@
   "settings.webhookUrlHint": "事件触发的出站 Webhook。留空 = 禁用。",
   "settings.saveWebhook": "保存 Webhook",
   "settings.webhookSaved": "Webhook 设置已保存",
-  "logs.persisted": "日志重启后保留"
+  "logs.persisted": "日志重启后保留",
+  "accounts.summaryAccounts": "账号（启用/总数）",
+  "accounts.summaryRequests": "总请求",
+  "accounts.summaryTokens": "总 Tokens",
+  "accounts.summaryCredits": "总 Credits"
 }

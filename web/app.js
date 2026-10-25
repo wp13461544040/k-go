@@ -1080,6 +1080,7 @@
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
+    renderAccountsSummary();
     const filtered = getFilteredAccounts();
     if (filtered.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
@@ -1154,6 +1155,38 @@
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+  }
+
+  // Sum cumulative usage across ALL accounts (not just the filtered list), so
+  // the credits/tokens/requests totals stay stable while searching or filtering.
+  function renderAccountsSummary() {
+    const elAccounts = $('accountsSummaryAccounts');
+    const elCredits = $('accountsSummaryCredits');
+    const elTokens = $('accountsSummaryTokens');
+    const elRequests = $('accountsSummaryRequests');
+    if (!elAccounts || !elCredits || !elTokens || !elRequests) return;
+
+    let enabledAccounts = 0;
+    let totalCredits = 0;
+    let totalTokens = 0;
+    let totalRequests = 0;
+    for (const a of accountsData) {
+      if (a.enabled && !(a.banStatus && a.banStatus !== 'ACTIVE')) enabledAccounts++;
+      totalCredits += a.totalCredits || 0;
+      totalTokens += a.totalTokens || 0;
+      totalRequests += a.requestCount || 0;
+    }
+
+    elAccounts.textContent = enabledAccounts + ' / ' + accountsData.length;
+    elCredits.textContent = formatCredits(totalCredits);
+    elTokens.textContent = formatNum(totalTokens);
+    elRequests.textContent = formatNum(totalRequests);
+  }
+
+  function formatCredits(n) {
+    if (!n) return '0';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    return n.toFixed(2);
   }
 
   // Account actions

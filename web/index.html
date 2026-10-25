@@ -248,6 +248,27 @@
             </select>
           </div>
 
+          <!-- All-accounts summary: cumulative credits/tokens/requests across
+               every account, independent of the list filters below. -->
+          <div id="accountsSummary" class="accounts-summary" aria-live="polite">
+            <div class="summary-item">
+              <span class="summary-label" data-i18n="accounts.summaryAccounts"></span>
+              <span class="summary-value" id="accountsSummaryAccounts">0</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label" data-i18n="accounts.summaryRequests"></span>
+              <span class="summary-value" id="accountsSummaryRequests">0</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label" data-i18n="accounts.summaryTokens"></span>
+              <span class="summary-value" id="accountsSummaryTokens">0</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label" data-i18n="accounts.summaryCredits"></span>
+              <span class="summary-value summary-value--credits" id="accountsSummaryCredits">0</span>
+            </div>
+          </div>
+
           <div id="accountsList"></div>
         </div>
       </div>
