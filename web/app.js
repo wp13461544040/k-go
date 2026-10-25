@@ -1172,8 +1172,8 @@
     let totalAccounts = accountsData.length;
     let availableAccounts = 0;
     let bannedAccounts = 0;
-    let totalCreditsAll = 0;
-    let totalCreditsUsed = 0;
+    let totalCreditsUsed = 0;      // 已使用积分（累计消耗）
+    let creditsRemaining = 0;      // 未使用积分（当前剩余可用）
     let totalTokens = 0;
     
     for (const a of accountsData) {
@@ -1185,19 +1185,16 @@
       if (a.banStatus && a.banStatus !== 'ACTIVE') {
         bannedAccounts++;
       }
-      // 统计积分（所有账号的总积分）
-      if (a.usageCurrent !== undefined) {
-        totalCreditsAll += a.usageCurrent || 0;
-      }
-      // 统计已使用积分（totalCredits字段）
+      // 统计已使用积分（totalCredits = 累计消耗的积分）
       totalCreditsUsed += a.totalCredits || 0;
+      // 统计未使用积分（usageCurrent = 当前剩余可用积分）
+      creditsRemaining += a.usageCurrent || 0;
       // 统计tokens
       totalTokens += a.totalTokens || 0;
     }
     
-    // 计算剩余积分
-    let creditsRemaining = totalCreditsAll - totalCreditsUsed;
-    if (creditsRemaining < 0) creditsRemaining = 0;
+    // 计算所有账号积分总数 = 已使用 + 未使用
+    let totalCreditsAll = totalCreditsUsed + creditsRemaining;
 
     elTotal.textContent = formatNum(totalAccounts);
     elAvailable.textContent = formatNum(availableAccounts);
