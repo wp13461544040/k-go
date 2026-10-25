@@ -577,5 +577,9 @@
   "settings.webhookUrlHint": "Outbound webhook invoked on events. Empty = disabled.",
   "settings.saveWebhook": "Save Webhook",
   "settings.webhookSaved": "Webhook settings saved",
-  "logs.persisted": "Logs persist across restart"
+  "logs.persisted": "Logs persist across restart",
+  "accounts.summaryAccounts": "Accounts (on / total)",
+  "accounts.summaryRequests": "Requests",
+  "accounts.summaryTokens": "Tokens",
+  "accounts.summaryCredits": "Credits"
 }
