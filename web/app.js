@@ -1160,12 +1160,13 @@
   // Sum quota/usage across ALL accounts (not just the filtered list), so the
   // totals stay stable while searching or filtering.
   //
-  // Field semantics (see config.Account and the account detail modal):
-  //   usageLimit   = 总额度 (total quota for the period)
-  //   usageCurrent = 已使用 (credits consumed in the period)
+  // Field semantics:
+  //   usageLimit   = 总额度 (quota for the current period)
+  //   totalCredits = 已使用积分 (the per-account "统计 → 总Credits" counter)
   //   remaining    = 总额度 - 已使用
-  // totalCredits is a locally accumulated counter and must NOT be used here:
-  // it spans periods and does not line up with usageLimit.
+  // Remaining is clamped at 0 per account so an over-quota account never eats
+  // into another account's remaining credits, and the totals always satisfy
+  // 总数 = 已使用 + 未使用.
   function renderAccountsSummary() {
     const elTotal = $('accountsSummaryTotal');
     const elAvailable = $('accountsSummaryAvailable');
@@ -1179,9 +1180,8 @@
     let totalAccounts = accountsData.length;
     let availableAccounts = 0;
     let bannedAccounts = 0;
-    let totalQuota = 0;            // Σ 总额度
-    let totalCreditsUsed = 0;      // Σ 已使用
-    let creditsRemaining = 0;      // Σ 剩余额度
+    let totalCreditsUsed = 0;      // Σ 已使用（各账号统计里的总Credits）
+    let creditsRemaining = 0;      // Σ 未使用（总额度 - 已使用）
     let totalTokens = 0;
 
     for (const a of accountsData) {
@@ -1193,21 +1193,22 @@
       if (a.banStatus && a.banStatus !== 'ACTIVE') {
         bannedAccounts++;
       }
-      // 主配额：usageLimit 是总额度，usageCurrent 是本周期已使用积分。
-      // 超量使用时该账号剩余额度按 0 计，不影响其他账号的剩余额度。
+      // 每个账号独立计算：总额度取 usageLimit，已使用取 totalCredits，
+      // 未使用 = max(0, 总额度 - 已使用)。
       const quotaLimit = Number(a.usageLimit) || 0;
-      const quotaUsed = Number(a.usageCurrent) || 0;
-      totalQuota += quotaLimit;
+      const quotaUsed = Number(a.totalCredits) || 0;
       totalCreditsUsed += quotaUsed;
       creditsRemaining += Math.max(0, quotaLimit - quotaUsed);
       // 统计tokens
       totalTokens += a.totalTokens || 0;
     }
 
+    const totalCreditsAll = totalCreditsUsed + creditsRemaining;
+
     elTotal.textContent = formatNum(totalAccounts);
     elAvailable.textContent = formatNum(availableAccounts);
     elBanned.textContent = formatNum(bannedAccounts);
-    elCreditsTotal.textContent = formatCredits(totalQuota);
+    elCreditsTotal.textContent = formatCredits(totalCreditsAll);
     elCreditsUsed.textContent = formatCredits(totalCreditsUsed);
     elCreditsRemaining.textContent = formatCredits(creditsRemaining);
     elTokens.textContent = formatNum(totalTokens);
