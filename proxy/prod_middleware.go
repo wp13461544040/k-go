@@ -90,8 +90,14 @@ func WrapHardening(inner http.Handler) http.Handler {
 }
 
 func wrapHardeningWith(inner http.Handler, rl *rateLimiter) http.Handler {
+	// The rate limiter sits outside Handler.ServeHTTP, so it needs a handle on the
+	// handler to record its 429s in the admin request log.
+	var sink *Handler
+	if h, ok := inner.(*Handler); ok {
+		sink = h
+	}
 	h := inner
-	h = rateLimitMiddleware(h, rl)
+	h = rateLimitMiddleware(h, rl, sink)
 	h = instrumentMiddleware(h)
 	h = securityHeadersMiddleware(h)
 	h = metricsRouter(h)
@@ -248,7 +254,10 @@ func instrumentMiddleware(next http.Handler) http.Handler {
 // rateLimitMiddleware enforces the global + per-key token buckets when the
 // limiter is enabled. Health/admin/static paths are exempt so the admin UI and
 // liveness checks stay reachable even while API traffic is being throttled.
-func rateLimitMiddleware(next http.Handler, rl *rateLimiter) http.Handler {
+//
+// sink (optional) is the owning Handler: every rejection is recorded as a 429
+// failure in the request log so throttling is visible in the admin panel.
+func rateLimitMiddleware(next http.Handler, rl *rateLimiter, sink *Handler) http.Handler {
 	if !rl.enabled() {
 		return next
 	}
@@ -263,6 +272,9 @@ func rateLimitMiddleware(next http.Handler, rl *rateLimiter) http.Handler {
 		}
 		if ok, retry := rl.Allow(key); !ok {
 			metricsRateLimited()
+			if sink != nil {
+				sink.recordRateLimitedRequest(r, key, "rate limit exceeded, retry later")
+			}
 			secs := int(retry.Seconds())
 			if secs < 1 {
 				secs = 1

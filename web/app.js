@@ -666,7 +666,7 @@
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion(), loadHealthCheckStatus()]);
     loadLogs();
     renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
     renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
@@ -1044,6 +1044,11 @@
       if (a.banStatus === 'BANNED') out.push('<span class="badge badge-banned">' + escapeHtml(t('accounts.banned')) + '</span>');
       else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended">' + escapeHtml(t('accounts.suspended')) + '</span>');
       out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
+      // 代理因配额耗尽自动禁用的账号：标注原因，避免用户以为是自己手动关的。
+      if (a.autoDisabledReason === 'quota') {
+        const tip = a.banReason ? ' title="' + escapeAttr(a.banReason) + '"' : '';
+        out.push('<span class="badge badge-error"' + tip + '>' + escapeHtml(t('accounts.quotaExhausted')) + '</span>');
+      }
     } else {
       if (!a.hasToken)
         out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
@@ -2800,13 +2805,28 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.credentialsDesc')) + '</p>' +
       '<p class="help-block">' + escapeHtml(t('credentials.batchHint')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('credentials.label')) + '</label>' +
+      '<div class="form-group">' +
+      '<label>' + escapeHtml(t('credentials.label')) + '</label>' +
+      '<div class="input-row">' +
       '<textarea id="credJson" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]&#10;or&#10;email----password----refreshToken----clientId----clientSecret\'></textarea>' +
+      '<label class="btn btn-outline btn-sm">' + escapeHtml(t('local.upload')) +
+      '<input type="file" accept=".json,application/json" id="credJsonFile" class="file-input-hidden" />' +
+      '</label>' +
+      '</div>' +
+      '</div>' +
+      '<div id="credImportProgress" class="import-progress hidden">' +
+      '<div class="import-progress-header">' +
+      '<span class="import-progress-spinner"></span>' +
+      '<span id="credImportLabel"></span>' +
+      '</div>' +
+      '<div class="import-progress-bar"><div id="credImportFill" class="import-progress-bar-fill" style="width:0%"></div></div>' +
+      '<div id="credImportDetail" class="import-progress-text"></div>' +
       '</div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importCredBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
+    $('credJsonFile').addEventListener('change', e => loadLocalFile(e.target, 'credJson'));
     $('importCredBtn').addEventListener('click', importCredentials);
   }
   function modalCookie(title, body) {
@@ -2911,6 +2931,29 @@
   async function importCredentials() {
     const raw = $('credJson').value.trim();
     if (!raw) { toastWarning(t('credentials.jsonError')); return; }
+    
+    // 禁用按钮，防止重复点击；同时展示进度区域
+    const importBtn = $('importCredBtn');
+    const originalBtnText = importBtn.textContent;
+    importBtn.disabled = true;
+    importBtn.textContent = t('credentials.importing') + '…';
+    const progressEl = $('credImportProgress');
+    const progressLabel = $('credImportLabel');
+    const progressFill = $('credImportFill');
+    const progressDetail = $('credImportDetail');
+    const resetImportButton = () => {
+      importBtn.disabled = false;
+      importBtn.textContent = originalBtnText;
+      if (progressEl) progressEl.classList.add('hidden');
+    };
+    const setProgress = (done, total, detail) => {
+      if (!progressEl) return;
+      progressEl.classList.remove('hidden');
+      if (progressLabel) progressLabel.textContent = t('credentials.importing') + ' ' + done + '/' + total;
+      if (progressFill) progressFill.style.width = (total > 0 ? Math.round(done * 100 / total) : 0) + '%';
+      if (progressDetail) progressDetail.textContent = detail || '';
+    };
+    
     let items;
     let skipped = 0;
     try {
@@ -2964,17 +3007,35 @@
       items = parsed.items;
       skipped = parsed.skipped;
       if (items.length === 0 && skipped === 0) {
+        resetImportButton();
         toastWarning(t('credentials.jsonError'));
         return;
       }
       if (items.length === 0) {
+        resetImportButton();
         toastWarning(t('credentials.lineParseAllSkipped', skipped));
         return;
       }
     }
+    
+    // 显示总进度
+    const total = items.length;
+    setProgress(0, total, t('credentials.importReady', total));
+
     let ok = 0, fail = 0, newIds = [];
-    for (const item of items) {
-      if (!item.refreshToken) { fail++; continue; }
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const display = item.email || ('#' + (i + 1));
+      if (!item.refreshToken) {
+        fail++;
+        setProgress(i + 1, total, t('credentials.importSkippedItem', display));
+        continue;
+      }
+
+      // 更新进度
+      importBtn.textContent = t('credentials.importing') + ' (' + (i + 1) + '/' + total + ')';
+      setProgress(i, total, t('credentials.importItem', i + 1, total, display));
+      
       const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
       let authMethod = (item.authMethod || '').toLowerCase();
       if (EXTERNAL_IDP.includes(authMethod) || item.tokenEndpoint) {
@@ -3010,7 +3071,16 @@
         if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
         else fail++;
       } catch { fail++; }
+      setProgress(i + 1, total, t('credentials.importProgressItem', i + 1, total));
     }
+
+    // 展示最终结果，短暂停留后关闭弹窗，让用户看清统计
+    setProgress(total, total, t('credentials.importResult', ok, fail));
+    if (progressDetail) {
+      progressDetail.className = 'import-progress-text ' + (fail > 0 ? 'import-progress-error' : 'import-progress-success');
+    }
+    await new Promise(r => setTimeout(r, 700));
+
     closeModal(); loadAccounts(); loadStats();
     let msg = t('sso.importSuccess', ok);
     if (fail > 0) msg += t('sso.importPartial', fail);
@@ -3647,6 +3717,9 @@
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
 
+    const hcBtn = $('healthCheckTriggerBtn');
+    if (hcBtn) hcBtn.addEventListener('click', triggerHealthCheck);
+
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
       const a = b.dataset.batch;
@@ -3990,6 +4063,94 @@
     return '<div class="stats-view-item' + cls + '"><div class="stats-view-value">' + escapeHtml(String(value)) + '</div><div class="stats-view-label">' + escapeHtml(label) + '</div></div>';
   }
 
+  // ==================== 健康检查 ====================
+
+  let healthCheckPollTimer = null;
+
+  async function loadHealthCheckStatus() {
+    try {
+      const res = await api('/health-check');
+      if (!res.ok) return;
+      const d = await res.json();
+      renderHealthCheckStatus(d);
+      // 检查仍在进行中时，2 秒后再拉一次
+      if (d.running) scheduleHealthCheckPoll();
+    } catch (e) { /* 静默失败 */ }
+  }
+
+  function scheduleHealthCheckPoll() {
+    if (healthCheckPollTimer) return;
+    healthCheckPollTimer = setTimeout(() => {
+      healthCheckPollTimer = null;
+      loadHealthCheckStatus();
+    }, 2000);
+  }
+
+  function stopHealthCheckPoll() {
+    if (healthCheckPollTimer) { clearTimeout(healthCheckPollTimer); healthCheckPollTimer = null; }
+  }
+
+  function renderHealthCheckStatus(d) {
+    const bar = $('healthCheckBar');
+    if (!bar) return;
+    bar.classList.remove('hidden');
+
+    const dot = $('healthCheckDot');
+    const text = $('healthCheckText');
+    const btn = $('healthCheckTriggerBtn');
+    if (!dot || !text) return;
+
+    if (d.running) {
+      dot.className = 'hc-dot hc-dot-running';
+      text.textContent = t('healthCheck.running');
+      if (btn) btn.disabled = true;
+      return;
+    }
+
+    // 已结束：恢复按钮，停止轮询
+    stopHealthCheckPoll();
+    if (btn) btn.disabled = false;
+
+    if (!d.lastRunAt) {
+      dot.className = 'hc-dot hc-dot-unknown';
+      text.textContent = t('healthCheck.never');
+      return;
+    }
+
+    const hasError = d.unhealthy > 0;
+    dot.className = 'hc-dot ' + (hasError ? 'hc-dot-error' : 'hc-dot-ok');
+
+    const lastTime = formatRelativeTime(d.lastRunAt);
+    let label = t('healthCheck.lastRun', lastTime) + ' · ' +
+      t('healthCheck.stats', d.healthy || 0, d.unhealthy || 0, d.skipped || 0);
+    if (d.nextRunAt) label += ' · ' + t('healthCheck.nextRun', formatRelativeTime(d.nextRunAt));
+    text.textContent = label;
+  }
+
+  function formatRelativeTime(unixSec) {
+    const diff = Math.floor(Date.now() / 1000) - unixSec;
+    if (diff < 0) {
+      const future = -diff;
+      if (future < 60) return t('healthCheck.inSeconds', future);
+      return t('healthCheck.inMinutes', Math.ceil(future / 60));
+    }
+    if (diff < 60) return t('healthCheck.secondsAgo', diff);
+    if (diff < 3600) return t('healthCheck.minutesAgo', Math.floor(diff / 60));
+    return t('healthCheck.hoursAgo', Math.floor(diff / 3600));
+  }
+
+  async function triggerHealthCheck() {
+    const btn = $('healthCheckTriggerBtn');
+    if (btn) btn.disabled = true;
+    try {
+      await api('/health-check/trigger', { method: 'POST' });
+      // 触发后立即查询一次状态，running=true 会自动开始轮询
+      await loadHealthCheckStatus();
+    } catch (e) {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   function wireEvents() {
     bindLoginEvents();
     bindShellEvents();
@@ -4015,7 +4176,10 @@
     wireEvents();
     if (password) tryAutoLogin();
     setInterval(() => {
-      if (!$('mainPage').classList.contains('hidden')) loadStats();
+      if (!$('mainPage').classList.contains('hidden')) {
+        loadStats();
+        loadHealthCheckStatus();
+      }
     }, 10000);
   }
 

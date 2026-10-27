@@ -85,6 +85,31 @@ func (p *AccountPool) ensurePoolMapsLocked() {
 	if p.runtimeStats == nil {
 		p.runtimeStats = make(map[string]*accountRuntimeStats)
 	}
+	if p.localUsage == nil {
+		p.localUsage = make(map[string]float64)
+	}
+	if p.swing == nil {
+		p.swing = make(map[string]float64)
+	}
+	if p.quotaCooldowns == nil {
+		p.quotaCooldowns = make(map[string]time.Time)
+	}
+}
+
+// effectiveCooldownLocked reports whether the account is currently kept out of
+// routing, and until when. It takes the later of the transient-error cooldown
+// (p.cooldowns, cleared on any success) and the quota cooldown
+// (p.quotaCooldowns, which a success on a sibling in-flight request must NOT
+// clear). Caller holds p.mu.
+func (p *AccountPool) effectiveCooldownLocked(id string, now time.Time) (time.Time, bool) {
+	var until time.Time
+	if c, ok := p.cooldowns[id]; ok && now.Before(c) {
+		until = c
+	}
+	if q, ok := p.quotaCooldowns[id]; ok && now.Before(q) && q.After(until) {
+		until = q
+	}
+	return until, !until.IsZero()
 }
 
 func (p *AccountPool) statsForAccountLocked(id string, now time.Time) *accountRuntimeStats {
@@ -136,6 +161,142 @@ func accountCandidateLess(a, b accountCandidate) bool {
 	default:
 		return a.recentSuccessCount < b.recentSuccessCount
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Quota-aware weighted scheduling
+//
+// The ordering above treats every eligible account as equally deserving of
+// traffic, so a 95%-consumed account receives the same share as a 5%-consumed
+// one. The former hits its limit far earlier, and every request that lands on
+// it afterwards fails (402 / overage) — an avoidable interruption, and exactly
+// the "one account exhausted while another sits at 5%" imbalance operators
+// report.
+//
+// Dispatch share is therefore proportional to (remaining quota × configured
+// priority weight ÷ (1 + in-flight)), realised deterministically with smooth
+// weighted round-robin: over N dispatches each account receives ≈ w_i/Σw · N,
+// so all accounts approach their limit together instead of one being drained
+// while another is barely touched.
+//
+// Remaining quota uses the last upstream-verified usage PLUS the credits burned
+// locally since that refresh (pool.localUsage, fed by UpdateStats from the
+// metering events), so the balance reacts within a refresh window rather than
+// up to 30 minutes later.
+// ---------------------------------------------------------------------------
+
+const (
+	// minHeadroomWeight guarantees a nearly exhausted account still receives a
+	// trickle of traffic. Without it the account would be starved forever and
+	// could never prove it recovered after a quota reset.
+	minHeadroomWeight = 0.02
+	// unknownUsageHeadroom is used for accounts whose usage has never been
+	// fetched (no UsageLimit/UsagePercent): treat them as fully available
+	// instead of starving them.
+	unknownUsageHeadroom = 1.0
+)
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// accountUsageRatioLocked returns the account's quota consumption ratio in
+// [0,1]: upstream-verified usage plus local credits burned since that refresh.
+// Caller holds p.mu.
+func (p *AccountPool) accountUsageRatioLocked(acc *config.Account) float64 {
+	if acc == nil {
+		return 0
+	}
+	if acc.UsageLimit <= 0 {
+		// UsageLimit unknown: fall back to the precomputed percentage, which
+		// kiro_api.go derives as UsageCurrent/UsageLimit (0..1).
+		if acc.UsagePercent > 0 {
+			ratio := acc.UsagePercent
+			if ratio > 1 {
+				ratio /= 100 // tolerate percent-scale values
+			}
+			return clamp01(ratio)
+		}
+		return 0
+	}
+	used := acc.UsageCurrent + p.localUsage[acc.ID]
+	return clamp01(used / acc.UsageLimit)
+}
+
+// accountHeadroomWeightLocked maps remaining quota to a selection weight.
+// Caller holds p.mu.
+func (p *AccountPool) accountHeadroomWeightLocked(acc *config.Account) float64 {
+	if acc == nil {
+		return unknownUsageHeadroom
+	}
+	if acc.UsageLimit <= 0 && acc.UsagePercent <= 0 {
+		// Never verified: assume full availability.
+		return unknownUsageHeadroom
+	}
+	headroom := 1 - p.accountUsageRatioLocked(acc)
+	if headroom < minHeadroomWeight {
+		headroom = minHeadroomWeight
+	}
+	if headroom > 1 {
+		headroom = 1
+	}
+	return headroom
+}
+
+// candidateDispatchWeightLocked combines remaining quota, the operator-set
+// priority weight and the live in-flight load into one share weight.
+// Caller holds p.mu.
+func (p *AccountPool) candidateDispatchWeightLocked(c accountCandidate) float64 {
+	w := p.accountHeadroomWeightLocked(c.account) * float64(effectiveWeight(c.account.Weight))
+	if c.inFlight > 0 {
+		// Load penalty: an account already serving N dispatches contributes
+		// w/(1+N), so a burst spreads across the pool instead of piling onto
+		// the single freshest account.
+		w /= float64(1 + c.inFlight)
+	}
+	if w <= 0 {
+		w = 1e-9
+	}
+	return w
+}
+
+// pickWeightedLocked selects one candidate via smooth weighted round-robin.
+// Caller holds p.mu.
+func (p *AccountPool) pickWeightedLocked(candidates []accountCandidate) accountCandidate {
+	p.ensurePoolMapsLocked()
+	inSet := make(map[string]bool, len(candidates))
+	var total float64
+	for _, c := range candidates {
+		id := c.account.ID
+		inSet[id] = true
+		w := p.candidateDispatchWeightLocked(c)
+		p.swing[id] += w
+		total += w
+	}
+	// Accounts that dropped out of the candidate set (cooldown / quota-blocked
+	// / model filter) must not accumulate credit while absent, otherwise they
+	// would return with a large burst.
+	for id := range p.swing {
+		if !inSet[id] {
+			delete(p.swing, id)
+		}
+	}
+	best := candidates[0]
+	bestSwing := p.swing[best.account.ID]
+	for _, c := range candidates[1:] {
+		if s := p.swing[c.account.ID]; s > bestSwing {
+			best = c
+			bestSwing = s
+		}
+	}
+	p.swing[best.account.ID] -= total
+	return best
 }
 
 func (p *AccountPool) markAccountSelectedLocked(id string, now time.Time) {
@@ -219,7 +380,7 @@ func (p *AccountPool) selectAccountLocked(model string, excluded map[string]bool
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		if _, cooling := p.effectiveCooldownLocked(acc.ID, now); cooling {
 			continue
 		}
 		candidates = append(candidates, p.accountCandidateLocked(acc, now))
@@ -251,7 +412,7 @@ func (p *AccountPool) selectAccountLocked(model string, excluded map[string]bool
 			continue
 		}
 		tokenOK := acc.ExpiresAt == 0 || nowUnix <= acc.ExpiresAt-tokenRefreshSkewSeconds
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
+		if cooldown, cooling := p.effectiveCooldownLocked(acc.ID, now); cooling {
 			// Only track cooling accounts with a valid token: a cooling +
 			// near-expired account would need both a cooldown wait AND a token
 			// refresh, making it worse than a plain last-resort candidate.
@@ -288,7 +449,15 @@ func (p *AccountPool) bestCandidateLocked(candidates []accountCandidate, now tim
 		return nil
 	}
 	candidates = applyConcurrencyCap(candidates)
-	best := selectCandidate(candidates)
+	var best accountCandidate
+	if poolStrategy == strategySmart {
+		// Default strategy: quota-aware smooth weighted round-robin. Explicit
+		// alternatives (round_robin / random / least_used / most_used) stay
+		// available via KIRO_SELECTION_STRATEGY for operators who want them.
+		best = p.pickWeightedLocked(candidates)
+	} else {
+		best = selectCandidate(candidates)
+	}
 	p.markAccountSelectedLocked(best.account.ID, now)
 	// Return a value copy, never an interior pointer into p.accounts: callers
 	// (ensureValidToken etc.) mutate AccessToken/ExpiresAt without holding p.mu,
@@ -326,8 +495,11 @@ func (p *AccountPool) ResetTransientState() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.cooldowns = make(map[string]time.Time)
+	p.quotaCooldowns = make(map[string]time.Time)
 	p.errorCounts = make(map[string]int)
 	p.runtimeStats = make(map[string]*accountRuntimeStats)
+	p.localUsage = make(map[string]float64)
+	p.swing = make(map[string]float64)
 	p.currentIndex = 0
 }
 

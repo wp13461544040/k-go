@@ -65,6 +65,8 @@ type Handler struct {
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	// 健康检查状态
+	hc *HealthCheckState
 }
 
 type thinkingStreamSource int
@@ -265,6 +267,8 @@ func NewHandler() *Handler {
 	}
 	h.promptCache.Load(cachePath)
 	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
+	// 初始化健康检查状态
+	h.hc = newHealthCheckState()
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动 token 预热 worker（2 分钟一轮，提前 15 分钟刷新即将过期的 token，
@@ -272,6 +276,8 @@ func NewHandler() *Handler {
 	go h.backgroundWarmup()
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
+	// 启动健康检查 goroutine（每 5 分钟轻量检查 token 有效性）
+	go h.backgroundHealthCheck()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
@@ -303,7 +309,12 @@ func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
+		// 因配额耗尽被自动禁用的账号也要刷新：额度重置后要据此自动恢复启用，
+		// 否则它会一直停在禁用状态直到人工干预。
+		if !account.Enabled && !account.IsAutoQuotaDisabled() {
+			continue
+		}
+		if account.AccessToken == "" {
 			continue
 		}
 
@@ -322,6 +333,10 @@ func (h *Handler) refreshAllAccounts() {
 		}
 
 		config.UpdateAccountInfo(account.ID, *info)
+		// 上游用量已经是权威值：清掉该账号的本地消耗估算，避免重复计数。
+		h.pool.ResetLocalUsage(account.ID)
+		// 用量耗尽 → 自动禁用；额度恢复 → 自动重新启用。
+		h.applyQuotaStateFromInfo(account, info)
 		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
 	}
 	h.pool.Reload()
@@ -333,8 +348,32 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 	return err == nil
 }
 
+// authFailureType maps an auth-layer rejection to the Logs tab's error type.
+// A 429 there means the API key is over its token/credit allowance (quota),
+// not that the credential itself is invalid.
+func authFailureType(status int) string {
+	if status == http.StatusTooManyRequests {
+		return "quota"
+	}
+	return "auth"
+}
+
+// resolveApiKeyIDForLog resolves the request's presented credential to its
+// configured key ID so the request log can attribute the failure to a key.
+// Error paths only; the key VALUE is never stored.
+func resolveApiKeyIDForLog(r *http.Request) string {
+	provided := extractProvidedKey(r)
+	if provided == "" {
+		return ""
+	}
+	if entry := config.FindApiKeyByValue(provided); entry != nil {
+		return entry.ID
+	}
+	return ""
+}
+
 // authenticateForClaude runs authenticate and writes a Claude-style error on failure.
-// Returns the request with the matched API key injected into context, or nil if auth failed.
+// Returns the request with the matched API key injected in context, or nil if auth failed.
 func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) *http.Request {
 	entry, err := h.authenticate(r)
 	if err != nil {
@@ -342,6 +381,7 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
 		}
+		h.recordRequestFailure(resolveApiKeyIDForLog(r), endpointLabelFromPath(r.URL.Path), "", ae.status, authFailureType(ae.status), ae.message)
 		h.sendClaudeError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
@@ -356,6 +396,7 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
 		}
+		h.recordRequestFailure(resolveApiKeyIDForLog(r), endpointLabelFromPath(r.URL.Path), "", ae.status, authFailureType(ae.status), ae.message)
 		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
@@ -789,16 +830,19 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "claude", "", 400, "request", "Failed to read request body")
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
 
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "claude", "", 400, "request", "Invalid JSON")
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
 	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "claude", req.Model, 400, "request", msg)
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
@@ -831,16 +875,19 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 读取请求
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "claude", "", 400, "request", "Failed to read request body")
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
 
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "claude", "", 400, "request", "Invalid JSON: "+err.Error())
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
 	if msg := validateClaudeRequestShape(&req); msg != "" {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "claude", req.Model, 400, "request", msg)
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
@@ -880,6 +927,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		h.recordRequestFailure(apiKeyID, "claude", model, 500, "unknown", "Streaming not supported")
 		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
 		return
 	}
@@ -1400,6 +1448,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		msg := "No available accounts"
 		if lastErr != nil {
 			msg = improperlyFormedClientMessage(lastErr)
+		} else {
+			// 没有任何可用账号：failedRequests 与日志都必须留痕，否则用户只看到
+			// 客户端不断报错、面板里却"一条失败都没有"。
+			h.recordRequestFailure(apiKeyID, "claude", model, 503, "unavailable", msg)
 		}
 		ensureMessageStart()
 		emit("error", map[string]interface{}{
@@ -1418,6 +1470,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.recordRequestFailure(apiKeyID, "claude", model, 503, "unavailable", "No available accounts")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
@@ -1526,6 +1579,54 @@ func (h *Handler) recordFailureWithDetails(apiKeyID, endpoint, model, accountID 
 	h.appendRequestLog(entry)
 }
 
+// recordRequestFailure records a request that failed BEFORE reaching an upstream
+// account: auth rejection, malformed/invalid payload, no routable account, or an
+// unsupported streaming mode. Those paths return an error to the client without
+// ever entering the dispatch loop, so previously they produced no log entry and
+// no failure counter — the panel looked like "nothing ever fails" while clients
+// were actually getting 400/401/503.
+func (h *Handler) recordRequestFailure(apiKeyID, endpoint, model string, status int, errType, message string) {
+	atomic.AddInt64(&h.totalRequests, 1)
+	atomic.AddInt64(&h.failedRequests, 1)
+	h.appendRequestLog(RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		Status:    "error",
+		Error:     fmt.Sprintf("HTTP %d: %s", status, message),
+		ErrorType: errType,
+		ApiKeyID:  apiKeyID,
+	})
+}
+
+// recordRateLimitedRequest records a request rejected by the inbound rate limiter
+// (HTTP 429). The limiter runs in the outer middleware chain, BEFORE Handler
+// .ServeHTTP, so without this hook those rejections never showed up in the
+// request log and the failure counters stayed at zero while clients were being
+// throttled.
+func (h *Handler) recordRateLimitedRequest(r *http.Request, key, message string) {
+	apiKeyID := ""
+	if key != "" && !strings.HasPrefix(key, "ip:") {
+		if entry := config.FindApiKeyByValue(key); entry != nil {
+			apiKeyID = entry.ID
+		}
+	}
+	h.recordRequestFailure(apiKeyID, endpointLabelFromPath(r.URL.Path), "", http.StatusTooManyRequests, "ratelimit", message)
+}
+
+// endpointLabelFromPath maps a request path to the Logs tab's endpoint label.
+func endpointLabelFromPath(path string) string {
+	switch {
+	case strings.Contains(path, "/messages"):
+		return "claude"
+	case strings.Contains(path, "/responses"):
+		return "responses"
+	case strings.Contains(path, "/chat/completions"), strings.Contains(path, "/completions"):
+		return "openai"
+	}
+	return "unknown"
+}
+
 // recordSuccessLog records a successful request in the request logs. inputTokens
 // and outputTokens are split (vs. the legacy Tokens total) so the Logs tab can
 // show in/out/cache per request. cacheRead/cacheCreation come from the prompt-
@@ -1566,12 +1667,18 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 }
 
 // classifyError categorizes an error message into a type for display.
+//
+// Ordering matters: an explicit overage/quota-exhaustion signal is a capacity
+// problem ("overage"/"quota"), whereas a bare 429 is upstream throttling
+// ("ratelimit") — the two need different operator responses.
 func classifyError(msg string) string {
 	switch {
-	case isQuotaErrorMessage(msg):
-		return "quota"
 	case isOverageErrorMessage(msg):
 		return "overage"
+	case isQuotaExhaustedMessage(msg):
+		return "quota"
+	case isQuotaErrorMessage(msg):
+		return "ratelimit"
 	case isSuspensionErrorMessage(msg):
 		return "suspended"
 	case isAuthErrorMessage(msg):
@@ -1732,6 +1839,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.recordRequestFailure(apiKeyID, "claude", model, 503, "unavailable", "No available accounts")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
@@ -1761,16 +1869,19 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "openai", "", 400, "request", "Failed to read request body")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "openai", "", 400, "request", "Invalid JSON")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
 	if msg := validateOpenAIRequestShape(&req); msg != "" {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "openai", req.Model, 400, "request", msg)
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
@@ -1799,6 +1910,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		h.recordRequestFailure(apiKeyID, "openai", model, 500, "unknown", "Streaming not supported")
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
 		return
 	}
@@ -2251,6 +2363,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		msg := "No available accounts"
 		if lastErr != nil {
 			msg = improperlyFormedClientMessage(lastErr)
+		} else {
+			// 没有任何可用账号：失败必须留痕，否则面板里看不到任何错误。
+			h.recordRequestFailure(apiKeyID, "openai", model, 503, "unavailable", msg)
 		}
 		errChunk := map[string]interface{}{
 			"id":      chatID,
@@ -2271,6 +2386,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.recordRequestFailure(apiKeyID, "openai", model, 503, "unavailable", "No available accounts")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -2365,6 +2481,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.recordRequestFailure(apiKeyID, "openai", model, 503, "unavailable", "No available accounts")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -2524,6 +2641,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportCredentials(w, r)
 	case path == "/auth/apikeys-batch" && r.Method == "POST":
 		h.apiImportApiKeys(w, r)
+	case path == "/health-check" && r.Method == "GET":
+		h.apiGetHealthStatus(w, r)
+	case path == "/health-check/trigger" && r.Method == "POST":
+		h.apiTriggerHealthCheck(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -2607,6 +2728,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"banStatus":         a.BanStatus,
 			"banReason":         a.BanReason,
 			"banTime":           a.BanTime,
+			"autoDisabledReason": a.AutoDisabledReason,
 			"expiresAt":         a.ExpiresAt,
 			"hasToken":          a.AccessToken != "",
 			"machineId":         a.MachineId,
@@ -2747,6 +2869,14 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	oldEnabled := existing.Enabled
 	if v, ok := updates["enabled"].(bool); ok {
 		existing.Enabled = v
+		// 人工切换启用状态即视为接管：清除自动禁用标记，否则配额恢复扫描
+		// 会把用户的决定覆盖掉（用户刚启用又被自动关掉）。
+		existing.AutoDisabledReason = ""
+		if v && existing.BanStatus == "DISABLED" {
+			existing.BanStatus = "ACTIVE"
+			existing.BanReason = ""
+			existing.BanTime = 0
+		}
 	}
 	if v, ok := updates["nickname"].(string); ok {
 		existing.Nickname = v
@@ -4200,6 +4330,13 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
+	// 用量刚被上游刷新过：清掉本地估算（避免重复计数）并重建账号池，
+	// 让配额感知的调度器立刻用上新的 UsageCurrent/UsageLimit。
+	h.pool.ResetLocalUsage(id)
+	// 用量耗尽 → 自动禁用；额度恢复 → 自动重新启用。
+	h.applyQuotaStateFromInfo(account, info)
+	h.pool.Reload()
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"info":    info,
@@ -4263,6 +4400,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"banStatus":         account.BanStatus,
 		"banReason":         account.BanReason,
 		"banTime":           account.BanTime,
+		"autoDisabledReason": account.AutoDisabledReason,
 		"subscriptionType":  account.SubscriptionType,
 		"subscriptionTitle": account.SubscriptionTitle,
 		"daysRemaining":     account.DaysRemaining,

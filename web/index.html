@@ -215,6 +215,11 @@
               <button class="btn btn-outline btn-sm" id="refreshAllModelsBtn" data-i18n-title="models.refreshAll"
                 data-i18n-aria-label="models.refreshAll"><i class="fa-solid fa-arrows-rotate"
                   aria-hidden="true"></i><span class="btn-text" data-i18n="models.refreshAll"></span></button>
+              <button class="btn btn-outline btn-sm" id="healthCheckTriggerBtn" data-i18n-title="healthCheck.triggerBtn"
+                data-i18n-aria-label="healthCheck.triggerBtn">
+                <i class="fa-solid fa-heart-pulse" aria-hidden="true"></i>
+                <span class="btn-text" data-i18n="healthCheck.triggerBtn"></span>
+              </button>
               <button class="btn btn-primary btn-sm" id="addAccountBtn" data-i18n-title="accounts.add"
                 data-i18n-aria-label="accounts.add"><i class="fa-solid fa-plus"
                   aria-hidden="true"></i><span class="btn-text" data-i18n="accounts.add"></span></button>
@@ -246,6 +251,12 @@
             <select id="filterTagSelect" class="w-32!" data-i18n-aria-label="filter.tag">
               <option value="" data-i18n="filter.allTags"></option>
             </select>
+          </div>
+
+          <!-- Health check status bar -->
+          <div id="healthCheckBar" class="health-check-bar hidden">
+            <span id="healthCheckDot" class="hc-dot hc-dot-unknown"></span>
+            <span id="healthCheckText" class="health-check-text"></span>
           </div>
 
           <!-- All-accounts summary: cumulative credits/tokens/requests across

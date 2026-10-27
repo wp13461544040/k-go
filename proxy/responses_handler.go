@@ -21,12 +21,14 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "responses", "", 400, "request", "Failed to read request body")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
 
 	var req ResponsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		h.recordRequestFailure(apiKeyIDFromContext(r.Context()), "responses", "", 400, "request", "Invalid JSON")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
@@ -52,6 +54,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 			// filesystem path (the raw os.PathError) nor distinguishes missing vs
 			// expired vs not-owner.
 			logger.Warnf("[Responses] previous_response_id %q load failed: %v", req.PreviousResponseID, loadErr)
+			h.recordRequestFailure(apiKeyID, "responses", req.Model, 404, "request", "previous_response_id not found")
 			h.sendOpenAIError(w, 404, "invalid_request_error", "previous_response_id not found")
 			return
 		}
@@ -60,6 +63,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	inputMessages, err := parseResponsesInput(req.Input)
 	if err != nil {
+		h.recordRequestFailure(apiKeyID, "responses", req.Model, 400, "request", err.Error())
 		h.sendOpenAIError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
@@ -80,6 +84,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	finalMessages = append(finalMessages, inputMessages...)
 
 	if len(finalMessages) == 0 {
+		h.recordRequestFailure(apiKeyID, "responses", req.Model, 400, "request", "input must contain at least one message")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "input must contain at least one message")
 		return
 	}
@@ -92,6 +97,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	if !hasUser {
+		h.recordRequestFailure(apiKeyID, "responses", req.Model, 400, "request", "input must contain at least one user message")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "input must contain at least one user message")
 		return
 	}
@@ -220,6 +226,7 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
+		h.recordRequestFailure(apiKeyID, "responses", model, 503, "unavailable", "No available accounts")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -295,6 +302,7 @@ func (h *Handler) handleResponsesStream(
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		h.recordRequestFailure(apiKeyID, "responses", model, 500, "unknown", "Streaming not supported")
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
 		return
 	}
@@ -580,6 +588,7 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
+		h.recordRequestFailure(apiKeyID, "responses", model, 503, "unavailable", "No available accounts")
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{

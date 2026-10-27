@@ -194,6 +194,13 @@ type Account struct {
 	BanReason string `json:"banReason,omitempty"` // Reason for ban/suspension
 	BanTime   int64  `json:"banTime,omitempty"`   // Timestamp when ban was detected
 
+	// AutoDisabledReason records why the proxy disabled this account on its own.
+	// Currently only "quota" (usage quota exhausted). Empty means the enabled
+	// state is operator-controlled: the proxy must never re-enable it by itself.
+	// This marker is what allows a quota-disabled account to come back
+	// automatically once its quota resets, without overriding a human decision.
+	AutoDisabledReason string `json:"autoDisabledReason,omitempty"`
+
 	// Subscription information
 	SubscriptionType  string `json:"subscriptionType,omitempty"`  // Tier: FREE, PRO, PRO_PLUS, or POWER
 	SubscriptionTitle string `json:"subscriptionTitle,omitempty"` // Human-readable subscription name
@@ -735,12 +742,16 @@ func UpdateAccountOverageStatus(id, status, capability string, cap, rate, curren
 // SetAccountEnabled toggles the enabled state of an account and persists the change.
 // Used to disable accounts whose refresh token has been revoked (401 Bad credentials)
 // so subsequent requests skip them automatically.
+//
+// Any auto-disable marker is cleared: this is an explicit state change (operator or
+// a non-quota auto rule), so quota auto-recovery must no longer touch the account.
 func SetAccountEnabled(id string, enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].Enabled = enabled
+			cfg.Accounts[i].AutoDisabledReason = ""
 			if enabled {
 				cfg.Accounts[i].BanStatus = "ACTIVE"
 				cfg.Accounts[i].BanReason = ""
@@ -757,6 +768,9 @@ func SetAccountEnabled(id string, enabled bool) error {
 
 // SetAccountBanStatus marks an account as banned/disabled with a reason.
 // Reason is recorded so operators can see why the account was auto-disabled.
+//
+// The quota auto-disable marker is cleared: a ban is not a quota state, so the
+// quota recovery sweep must not silently re-enable a banned account.
 func SetAccountBanStatus(id, status, reason string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -765,6 +779,7 @@ func SetAccountBanStatus(id, status, reason string) error {
 			cfg.Accounts[i].BanStatus = status
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = time.Now().Unix()
+			cfg.Accounts[i].AutoDisabledReason = ""
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
@@ -772,6 +787,76 @@ func SetAccountBanStatus(id, status, reason string) error {
 		}
 	}
 	return nil
+}
+
+// autoDisabledReasonQuota marks an account the proxy disabled because its usage
+// quota was exhausted. It is stored in Account.AutoDisabledReason so the account
+// can be re-enabled automatically once the quota recovers (monthly reset or a
+// raised limit), without overriding an operator's own enable/disable decision.
+const autoDisabledReasonQuota = "quota"
+
+// AutoDisabledReasonQuota returns the marker value used for quota auto-disable.
+func AutoDisabledReasonQuota() string { return autoDisabledReasonQuota }
+
+// IsAutoQuotaDisabled reports whether the account is currently disabled because
+// the proxy detected quota exhaustion (as opposed to an operator disabling it).
+func (a *Account) IsAutoQuotaDisabled() bool {
+	return a != nil && !a.Enabled && a.AutoDisabledReason == autoDisabledReasonQuota
+}
+
+// SetAccountAutoDisabledForQuota disables an account whose quota is exhausted and
+// records why. Returns true when the persisted state actually changed (a repeated
+// detection of the same state returns false so callers can skip side effects).
+func SetAccountAutoDisabledForQuota(id, reason string) (bool, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return false, nil
+	}
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		if a.ID != id {
+			continue
+		}
+		if !a.Enabled && a.AutoDisabledReason == autoDisabledReasonQuota && a.BanReason == reason {
+			return false, nil // already in the desired state
+		}
+		a.Enabled = false
+		a.BanStatus = "DISABLED"
+		a.BanReason = reason
+		a.BanTime = time.Now().Unix()
+		a.AutoDisabledReason = autoDisabledReasonQuota
+		return true, Save()
+	}
+	return false, nil
+}
+
+// ReenableAutoQuotaDisabled re-enables an account ONLY when the proxy itself
+// disabled it for quota exhaustion (i.e. the quota has come back). Accounts an
+// operator disabled, banned or suspended keep their state. Returns true when the
+// account was actually re-enabled.
+func ReenableAutoQuotaDisabled(id string) (bool, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return false, nil
+	}
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		if a.ID != id {
+			continue
+		}
+		if !a.IsAutoQuotaDisabled() {
+			return false, nil
+		}
+		a.Enabled = true
+		a.BanStatus = "ACTIVE"
+		a.BanReason = ""
+		a.BanTime = 0
+		a.AutoDisabledReason = ""
+		return true, Save()
+	}
+	return false, nil
 }
 
 func AutoQuarantineSuspicious429Reason() string {

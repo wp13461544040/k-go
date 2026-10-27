@@ -1471,12 +1471,18 @@ img.brand-icon {
 .err-badge--suspended { background: #fecaca; color: #7f1d1d; }
 .err-badge--overage { background: #ffedd5; color: #9a3412; }
 .err-badge--profile { background: #e0e7ff; color: #3730a3; }
+.err-badge--request { background: #e0f2fe; color: #075985; }
+.err-badge--unavailable { background: #f3e8ff; color: #6b21a8; }
+.err-badge--ratelimit { background: #fef9c3; color: #854d0e; }
 .err-badge--unknown { background: var(--muted); color: var(--muted-foreground); }
 [data-theme="dark"] .err-badge--quota { background: #451a03; color: #fde68a; }
 [data-theme="dark"] .err-badge--auth { background: #450a0a; color: #fca5a5; }
 [data-theme="dark"] .err-badge--suspended { background: #450a0a; color: #fca5a5; }
 [data-theme="dark"] .err-badge--overage { background: #431407; color: #fdba74; }
 [data-theme="dark"] .err-badge--profile { background: #1e1b4b; color: #a5b4fc; }
+[data-theme="dark"] .err-badge--request { background: #082f49; color: #7dd3fc; }
+[data-theme="dark"] .err-badge--unavailable { background: #2e1065; color: #d8b4fe; }
+[data-theme="dark"] .err-badge--ratelimit { background: #422006; color: #fde047; }
 
 /* Login screen */
 .login-wrapper {
@@ -4160,5 +4166,191 @@ img.brand-icon {
   .stats-view-uptime {
     flex-wrap: wrap;
     text-align: center;
+  }
+}
+
+/* 批量导入 loading 和进度提示样式 */
+.import-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+  background: var(--muted);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  margin-top: 0.75rem;
+}
+
+.import-progress-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 500;
+  color: var(--foreground);
+}
+
+.import-progress-spinner {
+  display: inline-block;
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid var(--border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: kiro-spin 0.8s linear infinite;
+}
+
+@keyframes kiro-spin {
+  to { transform: rotate(360deg); }
+}
+
+.import-progress-bar {
+  width: 100%;
+  height: 0.5rem;
+  background: var(--secondary);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  position: relative;
+}
+
+.import-progress-bar-fill {
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.3s ease;
+  border-radius: var(--radius-sm);
+}
+
+.import-progress-text {
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+  text-align: center;
+}
+
+.import-progress-success {
+  color: var(--success);
+}
+
+.import-progress-error {
+  color: var(--destructive);
+}
+
+/* 文件上传按钮样式 */
+.file-upload-wrapper {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.file-upload-input {
+  display: none;
+}
+
+.file-upload-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.25rem;
+  color: var(--primary-foreground);
+  background: var(--primary);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: opacity 0.15s ease, transform 0.1s ease;
+  user-select: none;
+}
+
+.file-upload-label:hover {
+  opacity: 0.9;
+}
+
+.file-upload-label:active {
+  transform: scale(0.98);
+}
+
+.file-upload-label[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.file-upload-name {
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 15rem;
+}
+
+/* 健康检查状态栏 */
+.health-check-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+  animation: hc-fade-in 0.25s ease;
+}
+
+@keyframes hc-fade-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.hc-dot {
+  flex: 0 0 auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--muted-foreground);
+}
+
+.hc-dot-ok {
+  background: var(--success);
+}
+
+.hc-dot-error {
+  background: var(--destructive);
+}
+
+.hc-dot-unknown {
+  background: var(--muted-foreground);
+}
+
+.hc-dot-running {
+  background: var(--info);
+  animation: hc-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes hc-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.health-check-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#healthCheckTriggerBtn[disabled] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+/* 小屏下状态栏换行 */
+@media (max-width: 640px) {
+  .health-check-bar {
+    flex-wrap: wrap;
+    padding: 0.5rem 0.75rem;
+  }
+  .health-check-text {
+    white-space: normal;
   }
 }

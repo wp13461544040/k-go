@@ -4,6 +4,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"math/rand"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -59,6 +60,34 @@ func isQuotaErrorMessage(msg string) bool {
 	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
 }
 
+// isQuotaExhaustedMessage narrows isQuotaErrorMessage down to "the quota is
+// actually used up". A plain 429 is a rate limit and must NEVER disable an
+// account: it recovers on its own within seconds, and disabling on it would take
+// healthy capacity out of the pool permanently.
+func isQuotaExhaustedMessage(msg string) bool {
+	m := strings.ToLower(msg)
+	for _, marker := range []string{
+		"quota exhausted",
+		"quota exceeded",
+		"quota limit",
+		"insufficient quota",
+		"no quota",
+		"overage",
+		"quota_exhausted",
+		"quota_exceeded",
+		"quota_limit",
+	} {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	// HTTP 402 Payment Required: the upstream billing/quota limit was reached.
+	if strings.Contains(m, "402") && strings.Contains(m, "limit") {
+		return true
+	}
+	return false
+}
+
 func isOverageErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
@@ -104,6 +133,9 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 	updatedAccount.BanStatus = banStatus
 	updatedAccount.BanReason = banReason
 	updatedAccount.BanTime = time.Now().Unix()
+	// A ban/suspension is not a quota state: drop the quota marker so the quota
+	// recovery sweep can never silently re-enable a banned account.
+	updatedAccount.AutoDisabledReason = ""
 
 	if err := config.UpdateAccount(account.ID, updatedAccount); err != nil {
 		logger.Warnf("[AccountFailover] Failed to disable %s: %v", account.Email, err)
@@ -158,9 +190,19 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		return
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
-		h.pool.RecordError(account.ID, false)
-	case isQuotaErrorMessage(errMsg):
 		h.pool.RecordError(account.ID, true)
+		// 402 OVERAGE：额度确实已经用尽。直接禁用，避免它继续被轮询到而反复报错。
+		h.disableQuotaExhaustedAccount(account, "overage limit reached")
+	case isQuotaErrorMessage(errMsg):
+		if isQuotaExhaustedMessage(errMsg) {
+			// 明确的额度耗尽：禁用账号（并从轮询里摘掉）。
+			h.pool.RecordError(account.ID, true)
+			h.disableQuotaExhaustedAccount(account, "")
+		} else {
+			// 普通 429 限流：只是短时拥塞，按瞬时错误做指数退避即可。
+			// 绝不能当成"额度耗尽"处理，否则健康账号会被长时间踢出池子。
+			h.pool.RecordError(account.ID, false)
+		}
 	case isSuspensionErrorMessage(errMsg):
 		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
 	case isProfileUnavailableErrorMessage(errMsg):
@@ -173,4 +215,132 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	default:
 		h.pool.RecordError(account.ID, false)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Quota auto-disable / auto-recover
+//
+// An account whose quota is used up cannot serve any request: every dispatch to
+// it fails upstream (402 / 429), and during the window before the pool notices
+// it the request error surfaces to the client as an interruption. Cooling it
+// down is not enough — it keeps coming back and keeps failing. So the account is
+// disabled outright and removed from routing, with a marker that lets the proxy
+// re-enable it by itself once the quota comes back (monthly reset / raised
+// limit), instead of waiting for an operator.
+//
+// Operators who opted into over-usage (global AllowOverUsage, or the per-account
+// upstream Overages switch) explicitly want exhausted accounts to keep serving,
+// so auto-disable is skipped for them.
+// ---------------------------------------------------------------------------
+
+// quotaAutoDisableAllowed reports whether the proxy may disable this account for
+// quota exhaustion.
+func quotaAutoDisableAllowed(account *config.Account) bool {
+	if account == nil {
+		return false
+	}
+	if config.GetAllowOverUsage() {
+		return false // global "keep serving over quota" switch
+	}
+	if strings.EqualFold(account.OverageStatus, "ENABLED") {
+		return false // per-account upstream Overages switch
+	}
+	return true
+}
+
+// disableQuotaExhaustedAccount disables an account whose usage quota is used up
+// and records a readable reason. Idempotent: repeated detections are a no-op.
+func (h *Handler) disableQuotaExhaustedAccount(account *config.Account, detail string) {
+	if account == nil || !quotaAutoDisableAllowed(account) {
+		return
+	}
+	reason := "quota exhausted"
+	if detail != "" {
+		reason += " (" + detail + ")"
+	}
+	changed, err := config.SetAccountAutoDisabledForQuota(account.ID, reason)
+	if err != nil {
+		logger.Warnf("[AccountFailover] Failed to auto-disable %s for quota: %v", account.Email, err)
+		return
+	}
+	if !changed {
+		return
+	}
+	logger.Warnf("[AccountFailover] Auto-disabled %s: %s", account.Email, reason)
+	notifyWebhook("account.quota_exhausted", map[string]interface{}{
+		"accountId": account.ID,
+		"email":     account.Email,
+		"banStatus": "DISABLED",
+		"banReason": reason,
+	})
+	h.pool.Reload()
+}
+
+// reenableQuotaRecoveredAccount re-enables an account the proxy had disabled for
+// quota exhaustion, once its usage is back under the limit. Returns true when the
+// account transitioned back to enabled.
+func (h *Handler) reenableQuotaRecoveredAccount(account *config.Account) bool {
+	if account == nil || !account.IsAutoQuotaDisabled() {
+		return false
+	}
+	ok, err := config.ReenableAutoQuotaDisabled(account.ID)
+	if err != nil {
+		logger.Warnf("[AccountFailover] Failed to re-enable %s: %v", account.Email, err)
+		return false
+	}
+	if !ok {
+		return false
+	}
+	logger.Infof("[AccountFailover] Re-enabled %s: quota recovered", account.Email)
+	notifyWebhook("account.quota_recovered", map[string]interface{}{
+		"accountId": account.ID,
+		"email":     account.Email,
+	})
+	h.pool.Reload()
+	return true
+}
+
+// applyQuotaStateFromInfo reconciles an account's enabled state with freshly
+// fetched usage limits: disable when exhausted, re-enable a quota-disabled
+// account once usage falls back under the limit.
+func (h *Handler) applyQuotaStateFromInfo(account *config.Account, info *config.AccountInfo) {
+	if account == nil || info == nil || info.UsageLimit <= 0 {
+		return
+	}
+	if info.UsageCurrent >= info.UsageLimit {
+		if account.Enabled {
+			h.disableQuotaExhaustedAccount(account, formatQuotaUsage(info.UsageCurrent, info.UsageLimit))
+		}
+		return
+	}
+	// Usage is back under the limit (e.g. the monthly reset landed).
+	h.reenableQuotaRecoveredAccount(account)
+}
+
+// tryRecoverQuotaDisabledAccount refreshes a quota-disabled account's usage and
+// re-enables it when the quota came back. Used by the periodic health check so
+// recovery does not wait for the 30-minute background refresh. Returns true when
+// the account was re-enabled.
+func (h *Handler) tryRecoverQuotaDisabledAccount(account *config.Account) bool {
+	if account == nil || !account.IsAutoQuotaDisabled() {
+		return false
+	}
+	info, err := RefreshAccountInfo(account)
+	if err != nil {
+		logger.Warnf("[AccountFailover] Quota-recovery refresh failed for %s: %v", account.Email, err)
+		return false
+	}
+	if err := config.UpdateAccountInfo(account.ID, *info); err != nil {
+		logger.Warnf("[AccountFailover] Quota-recovery persist failed for %s: %v", account.Email, err)
+		return false
+	}
+	if info.UsageLimit <= 0 || info.UsageCurrent >= info.UsageLimit {
+		return false
+	}
+	return h.reenableQuotaRecoveredAccount(account)
+}
+
+// formatQuotaUsage renders "12.3/50.0" for the disable reason string.
+func formatQuotaUsage(current, limit float64) string {
+	return strconv.FormatFloat(current, 'f', 1, 64) + "/" + strconv.FormatFloat(limit, 'f', 1, 64)
 }
