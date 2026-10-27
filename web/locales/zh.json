@@ -562,6 +562,7 @@
   "errors.typeRequest": "请求错误",
   "errors.typeUnavailable": "无可用账号",
   "errors.typeRatelimit": "限流",
+  "errors.typeClient": "客户端断开",
   "logs.filterKey": "密钥",
   "logs.filterModel": "模型",
   "logs.filterEndpoint": "端点",

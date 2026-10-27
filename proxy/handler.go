@@ -925,6 +925,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// Track write errors so a client that disappears mid-stream is recorded as a
+	// failure instead of a success (see proxy/sse_writer.go).
+	tw := &writeTrackingWriter{ResponseWriter: w}
+	w = tw
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.recordRequestFailure(apiKeyID, "claude", model, 500, "unknown", "Streaming not supported")
@@ -1376,6 +1381,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			return
 		}
 
+		// Client gone mid-stream? Record it instead of a bogus success.
+		if werr := tw.WriteError(); werr != nil {
+			h.recordClientDisconnect(apiKeyID, "claude", model, account.ID, reqStart, werr)
+			logger.Warnf("[Claude Stream] client disconnected mid-stream (account=%s, model=%s, after %s): %v",
+				account.Email, model, time.Since(reqStart).Round(time.Second), werr)
+			return
+		}
+
 		processClaudeText("", false, true)
 		if eventThinkingOpen {
 			sendText("", 3)
@@ -1580,6 +1593,25 @@ func (h *Handler) recordFailureWithDetails(apiKeyID, endpoint, model, accountID 
 	}
 
 	h.appendRequestLog(entry)
+}
+
+// recordClientDisconnect records a stream the CLIENT abandoned (user abort,
+// network drop, CDN idle timeout). These used to be invisible: write errors were
+// discarded and the request was logged as a success, so the panel showed
+// "nothing failed" while the user saw the conversation stop mid-sentence.
+func (h *Handler) recordClientDisconnect(apiKeyID, endpoint, model, accountID string, started time.Time, writeErr error) {
+	atomic.AddInt64(&h.totalRequests, 1)
+	atomic.AddInt64(&h.failedRequests, 1)
+	h.appendRequestLog(RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		Status:    "error",
+		Error:     fmt.Sprintf("client disconnected after %s: %v", time.Since(started).Round(time.Second), writeErr),
+		ErrorType: "client",
+		ApiKeyID:  apiKeyID,
+	})
 }
 
 // recordRequestFailure records a request that failed BEFORE reaching an upstream
@@ -1910,6 +1942,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	// Track write errors so a client that disappears mid-stream is recorded as a
+	// failure instead of a success (see proxy/sse_writer.go).
+	tw := &writeTrackingWriter{ResponseWriter: w}
+	w = tw
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -2288,6 +2325,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			}
 			h.recordFailureWithDetails(apiKeyID, "openai", model, account.ID, err)
 			logger.Errorf("[OpenAI Stream] stream interrupted mid-response for account %s: %v", account.Email, err)
+			return
+		}
+
+		// Client gone mid-stream? Record it instead of a bogus success.
+		if werr := tw.WriteError(); werr != nil {
+			h.recordClientDisconnect(apiKeyID, "openai", model, account.ID, reqStart, werr)
+			logger.Warnf("[OpenAI Stream] client disconnected mid-stream (account=%s, model=%s, after %s): %v",
+				account.Email, model, time.Since(reqStart).Round(time.Second), werr)
 			return
 		}
 

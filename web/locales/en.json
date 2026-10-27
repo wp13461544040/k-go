@@ -563,6 +563,7 @@
   "errors.typeRequest": "Bad request",
   "errors.typeUnavailable": "No capacity",
   "errors.typeRatelimit": "Rate limited",
+  "errors.typeClient": "Client closed",
   "logs.filterKey": "Key",
   "logs.filterModel": "Model",
   "logs.filterEndpoint": "Endpoint",

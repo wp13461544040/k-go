@@ -300,6 +300,11 @@ func (h *Handler) handleResponsesStream(
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// Track write errors so a client that disappears mid-stream is recorded as a
+	// failure instead of a success (see proxy/sse_writer.go).
+	tw := &writeTrackingWriter{ResponseWriter: w}
+	w = tw
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.recordRequestFailure(apiKeyID, "responses", model, 500, "unknown", "Streaming not supported")
@@ -518,6 +523,14 @@ func (h *Handler) handleResponsesStream(
 				},
 			})
 			h.recordFailureWithDetails(apiKeyID, "responses", model, account.ID, err)
+			return
+		}
+
+		// Client gone mid-stream? Record it instead of a bogus success.
+		if werr := tw.WriteError(); werr != nil {
+			h.recordClientDisconnect(apiKeyID, "responses", model, account.ID, reqStart, werr)
+			logger.Warnf("[Responses Stream] client disconnected mid-stream (account=%s, model=%s, after %s): %v",
+				account.Email, model, time.Since(reqStart).Round(time.Second), werr)
 			return
 		}
 

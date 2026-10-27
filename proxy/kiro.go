@@ -460,6 +460,10 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	// Counters used to tell a completed stream apart from one the upstream cut
+	// short: an empty stream (no frames at all) is always a failure, otherwise
+	// EOF is a normal end.
+	var eventCount, textLen, toolUseCount int
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -493,10 +497,22 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
+		headers := parseEventHeaders(msgBuf[0:headersLength])
+		eventType := headers[":event-type"]
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 		if len(payloadBytes) == 0 {
 			continue
+		}
+
+		// AWS Event Stream signals failures as a frame carrying
+		// :message-type=exception plus :exception-type=<Name>. Those frames have
+		// no :event-type, so they used to fall through the switch below silently,
+		// the next read hit EOF, and parseEventStream returned nil — the truncated
+		// stream was then logged as a SUCCESS. Surface them as real errors so the
+		// handler can retry another account and the panel records the failure.
+		if msgType := headers[":message-type"]; msgType == "exception" || msgType == "error" ||
+			headers[":exception-type"] != "" || strings.HasSuffix(eventType, "Exception") {
+			return newEventStreamError(headers[":exception-type"], eventType, payloadBytes)
 		}
 
 		var event map[string]interface{}
@@ -504,6 +520,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			logger.Debugf("[EventStream] Failed to unmarshal event payload (type=%s, len=%d): %v", eventType, len(payloadBytes), err)
 			continue
 		}
+		eventCount++
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
 
@@ -511,6 +528,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				textLen += len(content)
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
@@ -518,12 +536,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
+				textLen += len(text)
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
 				}
 			}
 		case "toolUseEvent":
+			toolUseCount++
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
@@ -535,8 +555,23 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 					callback.OnContextUsage(pct)
 				}
 			}
+		default:
+			// Unknown event types are normal (Kiro adds new ones); log at debug so a
+			// newly-introduced failure event is discoverable without noise.
+			logger.Debugf("[EventStream] ignoring event type %q", eventType)
 		}
 	}
+
+	// A stream that closed before delivering a single frame is never a normal
+	// completion: treat it as an upstream failure so it is retried and logged
+	// instead of being reported to the user as a successful empty answer.
+	if eventCount == 0 {
+		return fmt.Errorf("upstream event stream closed without any event (tokens=%d/%d)", inputTokens, outputTokens)
+	}
+	if textLen == 0 && toolUseCount == 0 {
+		logger.Warnf("[EventStream] stream completed with no content (events=%d, inputTokens=%d, outputTokens=%d)", eventCount, inputTokens, outputTokens)
+	}
+	logger.Debugf("[EventStream] completed: events=%d textBytes=%d toolUses=%d tokens=%d/%d", eventCount, textLen, toolUseCount, inputTokens, outputTokens)
 
 	if currentToolUse != nil {
 		finishToolUse(currentToolUse, callback)
@@ -835,54 +870,104 @@ func firstBoolField(m map[string]interface{}, keys ...string) bool {
 
 // extractEventType extracts the event type string from AWS Event Stream message headers.
 func extractEventType(headers []byte) string {
+	return parseEventHeaders(headers)[":event-type"]
+}
+
+// parseEventHeaders decodes the string-valued headers of an AWS Event Stream
+// message (name-length + name + type byte + value). Unlike extractEventType it
+// keeps :message-type and :exception-type too, which is how upstream failures
+// are delivered.
+func parseEventHeaders(headers []byte) map[string]string {
+	out := make(map[string]string, 4)
 	offset := 0
 	for offset < len(headers) {
-		if offset >= len(headers) {
-			break
-		}
 		nameLen := int(headers[offset])
 		offset++
 		if offset+nameLen > len(headers) {
-			break
+			return out
 		}
 		name := string(headers[offset : offset+nameLen])
 		offset += nameLen
 		if offset >= len(headers) {
-			break
+			return out
 		}
 		valueType := headers[offset]
 		offset++
 
-		if valueType == 7 { // String
+		switch valueType {
+		case 7: // string
 			if offset+2 > len(headers) {
-				break
+				return out
 			}
-			valueLen := int(headers[offset])<<8 | int(headers[offset+1])
+			l := int(headers[offset])<<8 | int(headers[offset+1])
 			offset += 2
-			if offset+valueLen > len(headers) {
-				break
+			if offset+l > len(headers) {
+				return out
 			}
-			value := string(headers[offset : offset+valueLen])
-			offset += valueLen
-			if name == ":event-type" {
-				return value
-			}
-			continue
-		}
-
-		// Skip other value types by their fixed byte widths.
-		skipSizes := map[byte]int{0: 0, 1: 0, 2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}
-		if valueType == 6 {
+			out[name] = string(headers[offset : offset+l])
+			offset += l
+		case 6: // byte array
 			if offset+2 > len(headers) {
-				break
+				return out
 			}
 			l := int(headers[offset])<<8 | int(headers[offset+1])
 			offset += 2 + l
-		} else if skip, ok := skipSizes[valueType]; ok {
-			offset += skip
-		} else {
-			break
+		case 2:
+			offset++
+		case 3:
+			offset += 2
+		case 4:
+			offset += 4
+		case 5, 8:
+			offset += 8
+		case 9:
+			offset += 16
+		case 0, 1: // bool: no payload
+		default:
+			return out
 		}
 	}
-	return ""
+	return out
+}
+
+// eventStreamError is an error frame delivered by the upstream event stream.
+type eventStreamError struct {
+	Type    string
+	Message string
+}
+
+func (e *eventStreamError) Error() string {
+	if e.Type == "" {
+		return "upstream event stream error: " + e.Message
+	}
+	return "upstream " + e.Type + ": " + e.Message
+}
+
+// newEventStreamError builds an error from an exception frame, preferring the
+// human-readable message inside the JSON payload.
+func newEventStreamError(exceptionType, eventType string, payload []byte) error {
+	name := exceptionType
+	if name == "" {
+		name = eventType
+	}
+	msg := ""
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(payload, &parsed); err == nil {
+		for _, k := range []string{"message", "Message", "errorMessage"} {
+			if v, ok := parsed[k].(string); ok && v != "" {
+				msg = v
+				break
+			}
+		}
+	}
+	if msg == "" {
+		msg = strings.TrimSpace(string(payload))
+		if len(msg) > 300 {
+			msg = msg[:300]
+		}
+	}
+	if msg == "" {
+		msg = "no message"
+	}
+	return &eventStreamError{Type: name, Message: msg}
 }
