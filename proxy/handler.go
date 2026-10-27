@@ -1352,6 +1352,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			// Log upstream failures with more context for diagnosis
+			logger.Warnf("[Claude Stream] Account %s failed (attempt %d/%d): %v", account.Email, attempt+1, retryBudget, err)
 			h.handleAccountFailure(account, err)
 			// Cache-dispatch observability: failed dispatch contributes 0 tokens so
 			// it cannot inflate the simulated cache_read subsidy (see cache_metrics.go).
@@ -1360,6 +1362,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				// Malformed request — no other account can succeed. Stop retrying;
 				// lastErr flows to the client. The relaying account was left neutral
 				// by handleAccountFailure (not penalised).
+				logger.Warnf("[Claude Stream] Permanent error detected, stopping retry: %v", err)
 				break
 			}
 			if !messageStarted {
@@ -2276,6 +2279,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logger.Warnf("[OpenAI Stream] account %s failed (attempt %d/%d): %v", account.Email, attempt+1, retryBudget, err)
 			if isUpstreamPermanentError(err) {
 				break
 			}
@@ -2283,6 +2287,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailureWithDetails(apiKeyID, "openai", model, account.ID, err)
+			logger.Errorf("[OpenAI Stream] stream interrupted mid-response for account %s: %v", account.Email, err)
 			return
 		}
 

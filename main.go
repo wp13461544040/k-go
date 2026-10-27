@@ -93,13 +93,16 @@ func main() {
 	rootHandler := proxy.WrapHardening(handler)
 
 	// WriteTimeout intentionally 0: SSE streams can run for minutes while the
-	// upstream model produces tokens. ReadHeaderTimeout + ReadTimeout still
-	// guard against slowloris-style header/body stalls.
+	// upstream model produces tokens. ReadTimeout also 0: long-running SSE
+	// responses mean the connection stays "reading" (from the server's view)
+	// for minutes while we write chunks. ReadHeaderTimeout guards against
+	// slowloris; the 64 MiB body cap + client timeouts bound real abuse.
+	// Before fix: ReadTimeout=60s killed opus thinking mid-stream.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           rootHandler,
 		ReadHeaderTimeout: 30 * time.Second,
-		ReadTimeout:       60 * time.Second,
+		ReadTimeout:       0, // was 60s — caused silent disconnects after 60s
 		IdleTimeout:       120 * time.Second,
 	}
 

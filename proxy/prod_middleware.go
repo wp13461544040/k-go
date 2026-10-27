@@ -123,6 +123,8 @@ func recoverMiddleware(next http.Handler) http.Handler {
 			metricsPanic()
 			logger.Errorf("[Recover] panic on %s %s (req=%s): %v\n%s",
 				r.Method, r.URL.Path, requestIDFromContext(r.Context()), rec, debug.Stack())
+			// Also log to warn/info so it's more visible in production logs
+			logger.Warnf("[Recover] Request failed with panic: method=%s path=%s", r.Method, r.URL.Path)
 			func() {
 				defer func() { _ = recover() }() // guard against write-after-headers panics
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")

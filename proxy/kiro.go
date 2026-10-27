@@ -415,6 +415,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		err = parseEventStream(resp.Body, callback)
 		resp.Body.Close()
+		if err != nil {
+			logger.Warnf("[KiroAPI] Event stream parsing failed on %s: %v", ep.Name, err)
+		}
 		return err
 	}
 
@@ -466,6 +469,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			break
 		}
 		if err != nil {
+			logger.Warnf("[EventStream] Failed to read prelude: %v", err)
 			return err
 		}
 
@@ -481,6 +485,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
+			logger.Warnf("[EventStream] Failed to read message body (remaining=%d): %v", remaining, err)
 			return err
 		}
 
@@ -496,6 +501,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 		var event map[string]interface{}
 		if err := json.Unmarshal(payloadBytes, &event); err != nil {
+			logger.Debugf("[EventStream] Failed to unmarshal event payload (type=%s, len=%d): %v", eventType, len(payloadBytes), err)
 			continue
 		}
 
