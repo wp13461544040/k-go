@@ -220,6 +220,8 @@
   "detail.proxySaved": "代理已保存",
   "detail.save": "保存",
   "modal.addAccount": "添加账号",
+  "modal.moreMethods": "更多添加方式",
+  "modal.moreMethodsHint": "Builder ID / 企业 SSO / 本地缓存 / Cookie / API 密钥",
   "modal.builderIdTitle": "AWS Builder ID",
   "modal.builderIdDesc": "通过 AWS Builder ID 授权登录添加个人账号",
   "modal.iamTitle": "IAM Identity Center (企业 SSO) 登录",

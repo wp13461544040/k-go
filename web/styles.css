@@ -2339,6 +2339,45 @@ img.brand-icon {
   gap: 0.625rem;
   margin-bottom: 1rem;
 }
+/* 默认唯一展示的「凭证 JSON」占满整行，作为主入口更醒目。 */
+.method-list--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+/* 「更多添加方式」开关行 */
+.method-more-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.125rem 0.75rem;
+  margin-top: -0.25rem;
+  cursor: pointer;
+  user-select: none;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  transition: color 0.15s ease;
+}
+.method-more-toggle:hover {
+  color: var(--foreground);
+}
+.method-more-label {
+  font-weight: 500;
+  white-space: nowrap;
+}
+.method-more-hint {
+  margin-left: auto;
+  font-size: 0.6875rem;
+  opacity: 0.7;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+@media (max-width: 640px) {
+  .method-more-hint {
+    display: none;
+  }
+}
 .method-card {
   display: flex;
   align-items: center;

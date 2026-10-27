@@ -2674,13 +2674,22 @@
   function modalAdd(title, body) {
     title.textContent = t('modal.addAccount');
     body.innerHTML =
-      '<div class="method-list">' +
+      // 默认只展示最常用的「凭证 JSON」，其余方式折叠在"更多添加方式"开关后面，
+      // 避免一进来就被 9 个入口淹没。
+      '<div class="method-list method-list--single">' +
+      methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
+      '</div>' +
+      '<label class="method-more-toggle" for="addMoreMethodsToggle">' +
+      '<span class="switch"><input type="checkbox" id="addMoreMethodsToggle" /><span class="slider"></span></span>' +
+      '<span class="method-more-label">' + escapeHtml(t('modal.moreMethods')) + '</span>' +
+      '<span class="method-more-hint">' + escapeHtml(t('modal.moreMethodsHint')) + '</span>' +
+      '</label>' +
+      '<div id="addMoreMethods" class="method-list hidden">' +
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('enterprisesso', t('modal.enterpriseSsoTitle'), t('modal.enterpriseSsoDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
-      methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
       methodCard('apikey', t('modal.apikeyTitle'), t('modal.apikeyDesc')) +
       methodCard('apikeybatch', t('modal.apikeyBatchTitle'), t('modal.apikeyBatchDesc')) +
@@ -3813,6 +3822,13 @@
       const g = e.target.closest('[data-modal-goto]');
       if (g) { showModal(g.dataset.modalGoto); return; }
       if (e.target.dataset.closeAdd) closeModal();
+    });
+
+    // "更多添加方式" 开关：默认折叠，勾选后展开其余添加方式。
+    $('modalBody').addEventListener('change', e => {
+      if (!e.target || e.target.id !== 'addMoreMethodsToggle') return;
+      const more = $('addMoreMethods');
+      if (more) more.classList.toggle('hidden', !e.target.checked);
     });
   }
 
