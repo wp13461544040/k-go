@@ -2812,17 +2812,27 @@
   function modalCredentials(title, body) {
     title.textContent = t('modal.credentialsTitle');
     body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.credentialsDesc')) + '</p>' +
-      '<p class="help-block">' + escapeHtml(t('credentials.batchHint')) + '</p>' +
+      // 说明区域：标题 + 提示，合并为一个信息卡
+      '<div class="cred-hint-card">' +
+      '<svg class="cred-hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>' +
+      '<div class="cred-hint-body">' +
+      '<p class="cred-hint-title">' + escapeHtml(t('modal.credentialsDesc')) + '</p>' +
+      '<p class="cred-hint-desc">' + escapeHtml(t('credentials.batchHint')) + '</p>' +
+      '</div>' +
+      '</div>' +
+      // 输入区域：标签行 + 上传按钮 + textarea
       '<div class="form-group">' +
-      '<label>' + escapeHtml(t('credentials.label')) + '</label>' +
-      '<div class="input-row">' +
-      '<textarea id="credJson" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]&#10;or&#10;email----password----refreshToken----clientId----clientSecret\'></textarea>' +
-      '<label class="btn btn-outline btn-sm">' + escapeHtml(t('local.upload')) +
+      '<div class="cred-field-header">' +
+      '<label class="cred-field-label">' + escapeHtml(t('credentials.label')) + '</label>' +
+      '<label class="btn btn-outline btn-sm cred-upload-btn">' +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
+      escapeHtml(t('local.upload')) +
       '<input type="file" accept=".json,application/json" id="credJsonFile" class="file-input-hidden" />' +
       '</label>' +
       '</div>' +
+      '<textarea id="credJson" class="font-mono cred-textarea" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]&#10;or&#10;email----password----refreshToken----clientId----clientSecret\'></textarea>' +
       '</div>' +
+      // 导入进度条
       '<div id="credImportProgress" class="import-progress hidden">' +
       '<div class="import-progress-header">' +
       '<span class="import-progress-spinner"></span>' +
