@@ -201,11 +201,22 @@ func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	// The streaming client must NOT carry a whole-request deadline: a 5m
+	// http.Client.Timeout truncated any generation longer than 300s. Long
+	// streams are bounded by kiroStreamHeaderTimeout + the idle watchdog instead.
+	if streamClient.Timeout != 0 {
+		t.Fatalf("expected streaming client to have no total timeout, got %s", streamClient.Timeout)
 	}
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
+	}
+
+	if tr, ok := streamClient.Transport.(*http.Transport); ok {
+		if tr.ResponseHeaderTimeout != kiroStreamHeaderTimeout {
+			t.Fatalf("expected header timeout %s, got %s", kiroStreamHeaderTimeout, tr.ResponseHeaderTimeout)
+		}
+	} else {
+		t.Fatalf("expected *http.Transport, got %T", streamClient.Transport)
 	}
 }
 

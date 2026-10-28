@@ -922,8 +922,14 @@ var streamKeepaliveInterval = 10 * time.Second
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
+	// X-Accel-Buffering: no tells nginx to disable proxy_buffering for this
+	// response. With buffering on, nginx holds SSE chunks until its buffer fills
+	// (~4KB), so clients see 30s bursts instead of a live stream, keepalive lines
+	// get swallowed, and a silent model can trip the proxy_read_timeout. The app
+	// cannot otherwise force a live stream through an nginx it does not control.
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	// Track write errors so a client that disappears mid-stream is recorded as a
 	// failure instead of a success (see proxy/sse_writer.go).
@@ -1940,8 +1946,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 // handleOpenAIStream OpenAI 流式响应
 func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
+	// See handleClaudeStream: stop nginx from buffering the SSE stream.
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	// Track write errors so a client that disappears mid-stream is recorded as a
 	// failure instead of a success (see proxy/sse_writer.go).

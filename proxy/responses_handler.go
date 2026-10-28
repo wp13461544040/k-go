@@ -297,8 +297,10 @@ func (h *Handler) handleResponsesStream(
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
+	// See handleClaudeStream: stop nginx from buffering the SSE stream.
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	// Track write errors so a client that disappears mid-stream is recorded as a
 	// failure instead of a success (see proxy/sse_writer.go).

@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+)
+
+// Timeout budget for streaming Kiro calls.
+//
+// The streaming client used to carry a whole-request `Timeout: 5 * time.Minute`.
+// http.Client.Timeout covers the ENTIRE exchange including draining the body, so
+// every generation longer than 5 minutes was killed at exactly 300s with
+// "context deadline exceeded (Client.Timeout or context cancellation while
+// reading body)" — reproduced with a long-output prompt. Long agent turns
+// (big refactors, spec writing) routinely exceed that.
+//
+// The timeout is now split:
+//   - kiroStreamHeaderTimeout: how long the upstream may take to send headers
+//     (token refresh + prefill). Replaces the old whole-request bound.
+//   - kiroStreamIdleTimeout: how long the body may stay silent. Any received
+//     byte resets it, so a slow-but-alive stream runs indefinitely while a dead
+//     connection still fails fast instead of hanging forever.
+const (
+	kiroStreamHeaderTimeout = 180 * time.Second
+	kiroStreamIdleTimeout   = 240 * time.Second
 )
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
@@ -71,7 +92,9 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		// No whole-request deadline: a stream is bounded by header timeout plus
+		// the per-read idle watchdog in CallKiroAPI, not by total elapsed time.
+		Timeout:   0,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -113,6 +136,9 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
+		// Bound only the wait for response headers; the body is governed by the
+		// per-read idle watchdog in CallKiroAPI so long streams are not cut.
+		ResponseHeaderTimeout: kiroStreamHeaderTimeout,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -129,7 +155,10 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		// See kiroStreamHeaderTimeout / kiroStreamIdleTimeout: streaming calls are
+		// bounded by header-arrival and per-read silence, never by total duration
+		// (a 5m whole-request cap used to truncate long generations at 300s).
+		Timeout:   0,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -377,23 +406,38 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
+		// Per-attempt context + idle watchdog: replaces the removed whole-request
+		// client timeout. A byte arriving resets the deadline (see idleTimeoutBody),
+		// so multi-minute generations keep running while a stalled connection is
+		// cancelled after kiroStreamIdleTimeout of silence.
+		ctx, cancel := context.WithCancel(context.Background())
+		req = req.WithContext(ctx)
+		var timedOut atomic.Bool
+		watchdog := time.AfterFunc(kiroStreamIdleTimeout, func() {
+			timedOut.Store(true)
+			cancel()
+		})
+
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
+			watchdog.Stop()
+			cancel()
 			lastErr = err
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 			continue
 		}
+		body := &idleTimeoutBody{rc: resp.Body, timer: watchdog, cancel: cancel, timedOut: &timedOut}
 
 		if resp.StatusCode == 429 {
-			resp.Body.Close()
+			body.Close()
 			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
 			continue
 		}
 
 		if resp.StatusCode != 200 {
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			errBody, _ := io.ReadAll(body)
+			body.Close()
 			// A 400 "Improperly formed request" is inherent to the request payload —
 			// no endpoint or account can fix it. Wrap it as a permanent rejection so
 			// CallKiroAPI's caller short-circuits (no other endpoint/account tried)
@@ -413,8 +457,8 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
-		resp.Body.Close()
+		err = parseEventStream(body, callback)
+		body.Close()
 		if err != nil {
 			logger.Warnf("[KiroAPI] Event stream parsing failed on %s: %v", ep.Name, err)
 		}
@@ -425,6 +469,35 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
+}
+
+// idleTimeoutBody enforces a per-read silence budget on a streaming response
+// body. Every received byte pushes the deadline out, so a long-but-alive stream
+// runs for as long as it needs while a stalled connection is cancelled promptly.
+// This is the read-timeout half of the replacement for the old whole-request
+// http.Client.Timeout (see kiroStreamIdleTimeout).
+type idleTimeoutBody struct {
+	rc       io.ReadCloser
+	timer    *time.Timer
+	cancel   context.CancelFunc
+	timedOut *atomic.Bool
+}
+
+func (b *idleTimeoutBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if n > 0 {
+		b.timer.Reset(kiroStreamIdleTimeout)
+	}
+	if err != nil && b.timedOut != nil && b.timedOut.Load() {
+		return n, fmt.Errorf("upstream stream idle for %s (no bytes received)", kiroStreamIdleTimeout)
+	}
+	return n, err
+}
+
+func (b *idleTimeoutBody) Close() error {
+	b.timer.Stop()
+	b.cancel()
+	return b.rc.Close()
 }
 
 // accountEmailForLog returns the most informative stable identifier for an
