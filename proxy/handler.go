@@ -1027,6 +1027,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, ctx context.Context,
 		messageStarted = true
 	}
 
+	// terminalSent records whether the client received a terminator (message_stop).
+	// The deferred check below is the last line of defence for the "对话直接结束、
+	// 面板里什么都没有" symptom: a stream that ends with neither message_stop nor an
+	// SSE error event is invisible to the client, so log exactly why we bailed out.
+	terminalSent := false
+	servedAccount := ""
+	defer func() {
+		if messageStarted && !terminalSent {
+			logger.Warnf("[Claude Stream] ended WITHOUT terminal event: elapsed=%s ctxErr=%v writeErr=%v account=%s model=%s",
+				time.Since(reqStart).Round(time.Second), ctx.Err(), tw.WriteError(), servedAccount, model)
+		}
+	}()
+
 	retryBudget := resolveAccountRetryBudget(h.pool.Count())
 	for attempt := 0; attempt < retryBudget; attempt++ {
 		if attempt > 0 {
@@ -1036,6 +1049,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, ctx context.Context,
 		if account == nil {
 			break
 		}
+		servedAccount = account.Email
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1462,6 +1476,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, ctx context.Context,
 		emit("message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
+		terminalSent = true
 		return
 	}
 
@@ -1500,6 +1515,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, ctx context.Context,
 		emit("message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
+		terminalSent = true
 		return
 	}
 
