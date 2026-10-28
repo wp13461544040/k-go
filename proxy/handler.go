@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -907,7 +908,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, r.Context(), kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
 		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
@@ -920,7 +921,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 var streamKeepaliveInterval = 10 * time.Second
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, ctx context.Context, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
@@ -1359,10 +1360,21 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithContext(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			// A cancelled parent context means the CLIENT left (stop button, network
+			// drop), not that the account failed. Free the account immediately and
+			// skip handleAccountFailure so an innocent account is never cooled down;
+			// leaving the upstream stream running is what made the follow-up
+			// "continue" request get dispatched to a still-busy account and die.
+			if ctx.Err() != nil {
+				h.recordClientDisconnect(apiKeyID, "claude", model, account.ID, reqStart, ctx.Err())
+				logger.Warnf("[Claude Stream] client went away after %s, upstream cancelled (account=%s, model=%s)",
+					time.Since(reqStart).Round(time.Second), account.Email, model)
+				return
+			}
 			// Log upstream failures with more context for diagnosis
 			logger.Warnf("[Claude Stream] Account %s failed (attempt %d/%d): %v", account.Email, attempt+1, retryBudget, err)
 			h.handleAccountFailure(account, err)
@@ -1937,14 +1949,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, r.Context(), kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	} else {
 		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, ctx context.Context, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
@@ -2319,10 +2331,18 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithContext(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			// Client left (stop/network drop): cancel already happened upstream, so
+			// just release and record — do not penalise the account.
+			if ctx.Err() != nil {
+				h.recordClientDisconnect(apiKeyID, "openai", model, account.ID, reqStart, ctx.Err())
+				logger.Warnf("[OpenAI Stream] client went away after %s, upstream cancelled (account=%s, model=%s)",
+					time.Since(reqStart).Round(time.Second), account.Email, model)
+				return
+			}
 			h.handleAccountFailure(account, err)
 			logger.Warnf("[OpenAI Stream] account %s failed (attempt %d/%d): %v", account.Email, attempt+1, retryBudget, err)
 			if isUpstreamPermanentError(err) {

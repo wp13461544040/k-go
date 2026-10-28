@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -125,7 +126,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	respID := generateResponseID()
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(w, r.Context(), kiroPayload, actualModel, thinking, estimatedInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
@@ -292,7 +293,7 @@ func buildResponsesObject(
 }
 
 func (h *Handler) handleResponsesStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	w http.ResponseWriter, ctx context.Context, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
@@ -502,10 +503,17 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithContext(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			// Client left: upstream already cancelled, release without penalising.
+			if ctx.Err() != nil {
+				h.recordClientDisconnect(apiKeyID, "responses", model, account.ID, reqStart, ctx.Err())
+				logger.Warnf("[Responses Stream] client went away after %s, upstream cancelled (account=%s, model=%s)",
+					time.Since(reqStart).Round(time.Second), account.Email, model)
+				return
+			}
 			h.handleAccountFailure(account, err)
 			if isUpstreamPermanentError(err) {
 				break

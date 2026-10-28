@@ -322,7 +322,24 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 }
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
+// It is CallKiroAPIWithContext with a background context; streaming handlers use
+// the context-aware variant so a client disconnect cancels the upstream call.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPIWithContext(context.Background(), account, payload, callback)
+}
+
+// CallKiroAPIWithContext streams one Kiro turn, aborting the upstream request as
+// soon as ctx is cancelled.
+//
+// Why the context matters: the streaming handlers used to call this with a
+// background context, so when a client went away (user pressed stop, network
+// dropped, browser tab closed) the proxy kept draining the upstream generation
+// to completion — minutes of quota burned, and worse, the account stayed busy
+// while the conversation stayed pinned to it by cache affinity. The user's next
+// "continue" request was then dispatched to that same occupied account and died
+// immediately. Passing the inbound request context tears the upstream stream
+// down the moment the client leaves.
+func CallKiroAPIWithContext(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -331,6 +348,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}()
 	}
 	setPayloadProfileArnForAccount(payload, account)
+
+	// Bail out before doing any work (profile lookup, payload marshalling) if the
+	// caller already went away.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if _, err := json.Marshal(payload); err != nil {
 		return err
@@ -409,9 +432,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		// Per-attempt context + idle watchdog: replaces the removed whole-request
 		// client timeout. A byte arriving resets the deadline (see idleTimeoutBody),
 		// so multi-minute generations keep running while a stalled connection is
-		// cancelled after kiroStreamIdleTimeout of silence.
-		ctx, cancel := context.WithCancel(context.Background())
-		req = req.WithContext(ctx)
+		// cancelled after kiroStreamIdleTimeout of silence. Cancelling the parent
+		// ctx (client disconnected) aborts this attempt immediately.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attemptCtx, cancel := context.WithCancel(ctx)
+		req = req.WithContext(attemptCtx)
 		var timedOut atomic.Bool
 		watchdog := time.AfterFunc(kiroStreamIdleTimeout, func() {
 			timedOut.Store(true)
