@@ -1971,6 +1971,27 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// isEmptyOpenAICompletion 判断一次已结束的 OpenAI 流是否"什么都没产出"：
+// 没有可见正文、也没有工具调用。reasoning 以正文形式（thinking/think 标签）
+// 输出时客户端已经看到内容，不算空响应。
+func isEmptyOpenAICompletion(visibleContent string, toolCallCount int, clientSawThinkingText bool) bool {
+	return strings.TrimSpace(visibleContent) == "" && toolCallCount == 0 && !clientSawThinkingText
+}
+
+// openAIEmptyStreamError 构造流内错误事件载荷，用于已经向客户端输出过内容、
+// 无法安全换号重试时收尾。消息里的 "stream ended without" 会被 OpenAI 兼容
+// 客户端（如 DSH 的 pi-ai 适配器）归类为 TRANSPORT 错误并自动重试。
+func openAIEmptyStreamError() []byte {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]string{
+			"message": "upstream stream ended without visible content",
+			"type":    "server_error",
+			"code":    "empty_response",
+		},
+	})
+	return payload
+}
+
 // handleOpenAIStream OpenAI 流式响应
 func (h *Handler) handleOpenAIStream(w http.ResponseWriter, ctx context.Context, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -2402,6 +2423,38 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, ctx context.Context,
 		for _, tc := range toolCalls {
 			outputTokens += estimateApproxTokens(tc.Function.Name)
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+		}
+
+		// 空响应防护：上游偶尔会返回 finish_reason=stop，但只有思考、没有正文也没有
+		// 工具调用。这种"完成"绝不能当成功收尾：客户端（例如 DSH）只会把 content 完全
+		// 为空的响应判成 EMPTY_RESPONSE 并重试，而只有 reasoning 的响应对它来说是一个
+		// 合法的 stop——表现为"对话无缘无故直接结束、看不到任何失败记录"。
+		//
+		// 处理策略：
+		//   - 还没向客户端写出任何 chunk：换下一个账号重试（对客户端完全透明）；
+		//   - 已经写出过 chunk（通常只有 reasoning_content)：发一个明确的 error 事件
+		//     并结束流，让客户端知道本次失败并自行重试，而不是静默完成。
+		//
+		// thinking 以正文形式（<thinking>/<think> 标签）输出时客户端已经看到内容，
+		// 不算空响应，保持原有行为。
+		visibleContent := strings.TrimSpace(outputContent)
+		clientSawThinkingText := thinking && (thinkingFormat == "thinking" || thinkingFormat == "think")
+		if isEmptyOpenAICompletion(visibleContent, len(toolCalls), clientSawThinkingText) {
+			emptyErr := fmt.Errorf("upstream returned no visible content (reasoning-only completion, model=%s)", model)
+			lastErr = emptyErr
+			excluded[account.ID] = true
+			// 只做软失败（短冷却），不因上游模型行为禁用账号本身。
+			h.handleAccountFailure(account, emptyErr)
+			h.recordFailureWithDetails(apiKeyID, "openai", model, account.ID, emptyErr)
+			logger.Warnf("[OpenAI Stream] empty completion from account %s (attempt %d/%d): no visible content and no tool calls", account.Email, attempt+1, retryBudget)
+
+			if !responseStarted && attempt+1 < retryBudget {
+				continue
+			}
+
+			emitRaw(fmt.Sprintf("data: %s\n\n", string(openAIEmptyStreamError())))
+			emitRaw("data: [DONE]\n\n")
+			return
 		}
 
 		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
